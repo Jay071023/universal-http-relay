@@ -1,0 +1,26 @@
+[Unit]
+Description=QQ Load Balancer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=qqlb
+Group=qqlb
+WorkingDirectory=@APP_DIR@
+Environment=NODE_ENV=production
+Environment=LB_CONFIG_PATH=@APP_DIR@/config.json
+EnvironmentFile=-/etc/qq-load-balancer/lb.env
+ExecStart=@NODE_BIN@ @APP_DIR@/lb-server.js
+Restart=always
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=@APP_DIR@
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Universal HTTP Relay Linux / 宝塔部署教学与远程热更新操作手册">
+  <title>Universal HTTP Relay · 宝塔部署手册</title>
+  <style>
+    :root{--bg:#f4f7fb;--card:#fff;--ink:#152238;--muted:#64748b;--line:#e5eaf2;--primary:#2563eb;--primary2:#0ea5e9;--good:#16a34a;--code:#101827;--shadow:0 16px 42px rgba(15,23,42,.08)}
+    *{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:radial-gradient(circle at 8% 0,#dbeafe 0,transparent 32rem),var(--bg);color:var(--ink);font:15px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif}
+    a{color:var(--primary);text-decoration:none}a:hover{text-decoration:underline}.wrap{max-width:1180px;margin:auto;padding:28px 20px 70px}
+    .hero{position:relative;overflow:hidden;color:#fff;background:linear-gradient(135deg,#172554,#1d4ed8 55%,#0891b2);border-radius:28px;padding:44px 46px;box-shadow:0 22px 60px rgba(30,64,175,.24)}
+    .hero:after{content:"";position:absolute;width:340px;height:340px;border:1px solid rgba(255,255,255,.2);border-radius:50%;right:-100px;top:-140px;box-shadow:0 0 0 35px rgba(255,255,255,.05),0 0 0 70px rgba(255,255,255,.04)}
+    .eyebrow{letter-spacing:.15em;text-transform:uppercase;font-size:12px;opacity:.75}.hero h1{position:relative;margin:8px 0 10px;font-size:clamp(30px,5vw,52px);line-height:1.15;letter-spacing:-.04em}.hero p{position:relative;max-width:720px;margin:0;color:#dbeafe;font-size:17px}
+    .chips{position:relative;display:flex;gap:10px;flex-wrap:wrap;margin-top:24px}.chip{border:1px solid rgba(255,255,255,.22);background:rgba(255,255,255,.1);border-radius:999px;padding:5px 12px;font-size:13px}
+    .layout{display:grid;grid-template-columns:250px 1fr;gap:24px;margin-top:24px}.toc{position:sticky;top:18px;align-self:start;background:rgba(255,255,255,.8);backdrop-filter:blur(12px);border:1px solid var(--line);border-radius:18px;padding:18px;box-shadow:var(--shadow)}.toc strong{display:block;margin-bottom:10px}.toc a{display:block;padding:7px 9px;border-radius:9px;color:var(--muted);font-size:14px}.toc a:hover{background:#eff6ff;color:var(--primary);text-decoration:none}
+    .main{min-width:0}.section{scroll-margin-top:20px;margin-bottom:24px;background:var(--card);border:1px solid var(--line);border-radius:20px;padding:28px;box-shadow:var(--shadow)}.section h2{margin:0 0 6px;font-size:25px;letter-spacing:-.02em}.section h3{margin:24px 0 8px;font-size:18px}.lead{margin:0 0 18px;color:var(--muted)}
+    .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.grid.three{grid-template-columns:repeat(3,minmax(0,1fr))}.stat,.note,.danger,.ok{border-radius:14px;padding:15px 16px;border:1px solid var(--line);background:#f8fafc}.stat b{display:block;font-size:20px;margin-bottom:2px}.stat span{color:var(--muted);font-size:13px}.note{border-color:#bfdbfe;background:#eff6ff}.danger{border-color:#fecaca;background:#fff1f2}.ok{border-color:#bbf7d0;background:#f0fdf4}.note b,.danger b,.ok b{display:block;margin-bottom:3px}.muted{color:var(--muted)}
+    .step{display:grid;grid-template-columns:42px 1fr;gap:14px;margin:20px 0}.num{width:36px;height:36px;display:grid;place-items:center;border-radius:12px;background:linear-gradient(135deg,var(--primary),var(--primary2));color:#fff;font-weight:700;box-shadow:0 6px 15px rgba(37,99,235,.25)}.step h3{margin:0 0 5px}.step p{margin:0;color:var(--muted)}
+    .code{position:relative;margin:11px 0 16px;background:var(--code);border:1px solid #202c41;border-radius:13px;overflow:auto}.code pre{margin:0;padding:17px 18px 16px;color:#dbeafe;white-space:pre;overflow:auto;font:13px/1.65 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace}.copy{position:absolute;right:9px;top:9px;border:1px solid #40516e;background:#1f2d45;color:#dbeafe;border-radius:7px;padding:4px 9px;cursor:pointer;font-size:12px}.copy:hover{background:#2f4261}.copy.done{background:#166534;border-color:#22c55e}
+    .kv{display:grid;grid-template-columns:170px 1fr;border:1px solid var(--line);border-radius:12px;overflow:hidden}.kv div{padding:10px 12px;border-bottom:1px solid var(--line)}.kv div:nth-last-child(-n+2){border-bottom:0}.kv div:nth-child(odd){background:#f8fafc;color:var(--muted)}
+    .checklist{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.check{display:flex;gap:9px;align-items:flex-start;padding:11px 12px;border:1px solid var(--line);border-radius:11px;background:#fbfdff}.check input{margin-top:5px;accent-color:var(--primary)}
+    details{border:1px solid var(--line);border-radius:12px;padding:12px 15px;margin:10px 0;background:#fbfdff}summary{cursor:pointer;font-weight:600}details p{margin:10px 0 0;color:var(--muted)}textarea{width:100%;min-height:340px;resize:vertical;border:1px solid #26344d;border-radius:12px;background:var(--code);color:#dbeafe;padding:17px;font:13px/1.65 ui-monospace,SFMono-Regular,Consolas,monospace}.footer{color:var(--muted);text-align:center;font-size:13px;padding-top:10px}.small{font-size:13px;color:var(--muted)}
+    @media(max-width:860px){.layout{grid-template-columns:1fr}.toc{position:static;display:flex;gap:6px;flex-wrap:wrap;align-items:center}.toc strong{width:100%;margin-bottom:0}.toc a{padding:5px 8px}.grid.three{grid-template-columns:1fr 1fr}}
+    @media(max-width:580px){.wrap{padding:14px 12px 40px}.hero{padding:28px 24px;border-radius:20px}.section{padding:21px 17px;border-radius:16px}.grid,.grid.three,.checklist{grid-template-columns:1fr}.kv{grid-template-columns:1fr}.kv div:nth-last-child(-n+2){border-bottom:1px solid var(--line)}.kv div:last-child{border-bottom:0}.step{grid-template-columns:34px 1fr;gap:10px}.num{width:30px;height:30px;border-radius:9px}.hero p{font-size:15px}}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="hero">
+      <div class="eyebrow">Deployment Playbook · v2.1.0</div>
+      <h1>宝塔部署手册</h1>
+      <p>给人看得懂，也给 AI 执行得明白。按照本页完成上传、初始化、PM2 守护、端口放行、远程热更新和故障排查。</p>
+      <div class="chips"><span class="chip">Node.js + Express</span><span class="chip">Linux / 宝塔</span><span class="chip">安装时随机生成 Token</span><span class="chip">慢请求最长等待：120 秒</span></div>
+    </header>
+
+    <div class="layout">
+      <nav class="toc" aria-label="目录">
+        <strong>本页目录</strong>
+        <a href="#overview">先看结论</a><a href="#install">宝塔部署</a><a href="#remote">远程热更新</a><a href="#reliability">请求可靠性</a><a href="#troubleshoot">故障排查</a><a href="#ai">交给 AI 执行</a><a href="#check">上线检查</a>
+      </nav>
+
+      <main class="main">
+        <section class="section" id="overview">
+          <h2>先看结论</h2>
+          <p class="lead">这不是 PHP 项目。宝塔只负责服务器、Node.js 环境和进程守护；程序本身由 Node.js 运行。</p>
+          <div class="grid three"><div class="stat"><b>8888</b><span>业务 HTTP / 管理面板端口（可调整）</span></div><div class="stat"><b>9001</b><span>示例热更新端口，可换成任意未占用端口</span></div><div class="stat"><b>安装时生成的随机Token</b><span>远程更新 Token，安装时随机生成</span></div></div>
+          <div class="note" style="margin-top:15px"><b>部署结构</b>主进程是 <code>lb-server.js</code>，远程更新/控制进程是 <code>deploy-server.js</code>。两个进程都要启动，缺一不可。</div>
+        </section>
+
+        <section class="section" id="install">
+          <h2>一、宝塔部署</h2>
+          <p class="lead">推荐使用 PM2 配置文件启动两个进程，后续重启服务器也会自动拉起。</p>
+
+          <div class="step"><div class="num">1</div><div><h3>上传部署包</h3><p>把 ZIP 上传并解压到：</p><div class="code"><button class="copy" data-copy="/www/wwwroot/universal-http-relay">复制</button><pre>/www/wwwroot/universal-http-relay</pre></div><p class="small">确认该目录下能看到 <code>package.json</code>、<code>lb-server.js</code>、<code>deploy-server.js</code>。</p></div></div>
+
+          <div class="step"><div class="num">2</div><div><h3>安装 Node.js 18 或 20</h3><p>宝塔「软件商店」安装 Node.js 版本管理器，选择 Node.js 18+，然后检查：</p><div class="code"><button class="copy">复制</button><pre>node -v
+npm -v</pre></div><p class="small">如果提示找不到 node，先在版本管理器中设置命令行默认版本，再重新打开终端。</p></div></div>
+
+          <div class="step"><div class="num">3</div><div><h3>安装依赖并初始化</h3><div class="code"><button class="copy">复制</button><pre>cd /www/wwwroot/universal-http-relay
+npm ci --omit=dev
+node scripts/init-config.js</pre></div><p class="small">初始化命令会生成运行配置，并显示管理员密码和 Agent Token。请保存好，不要把真实 <code>config.json</code> 发给别人。</p></div></div>
+
+          <div class="step"><div class="num">4</div><div><h3>登录后台</h3><p>后台只有密码，没有用户名。主服务启动后，用浏览器打开：</p><div class="code"><button class="copy" data-copy="http://服务器IP:8888/">复制</button><pre>http://服务器IP:8888/</pre></div><p class="small">输入初始化时显示的 <code>ADMIN_PASSWORD</code>。如果配置了 Nginx 域名，就打开对应的域名地址；如果修改了 <code>LB_PORT</code>，把 8888 换成实际端口。</p><div class="note"><b>三个凭据不要混淆</b><br><code>ADMIN_PASSWORD</code>：浏览器登录后台；<code>AGENT_TOKEN</code>：节点 Agent 连接认证；<code>DEPLOY_TOKEN=安装时生成的随机Token</code>：你这边远程上传、重启和控制服务器。浏览器登录成功后会保存 7 天会话。</div></div></div>
+
+          <div class="step"><div class="num">5</div><div><h3>创建远程控制配置</h3><p>在项目根目录新建 <code>.deploy.env</code>，端口用 9001 举例：</p><div class="code"><button class="copy">复制</button><pre>DEPLOY_BASE_DIR=/www/wwwroot/universal-http-relay
+DEPLOY_BIND=0.0.0.0
+DEPLOY_PORT=9001
+DEPLOY_TOKEN=安装时生成的随机Token
+DEPLOY_SERVICE_MANAGER=pm2
+DEPLOY_PROCESS_NAME=lb-server</pre></div><div class="danger"><b>安全边界</b><span>热更新端口只提供认证后的文件更新、状态查询、健康检查和受控重启，不提供任意 Shell。必须把 9001 限制为你的固定 IP。</span></div></div></div>
+
+          <div class="step"><div class="num">6</div><div><h3>启动 PM2</h3><div class="code"><button class="copy">复制</button><pre>cd /www/wwwroot/universal-http-relay
+chmod 600 .deploy.env
+pm2 start ecosystem.config.js
+pm2 status
+pm2 save
+pm2 startup</pre></div><p class="small"><code>pm2 startup</code> 会输出一条系统命令，把它复制执行一次。之后重启服务器，两个 Node 进程会自动恢复。</p></div></div>
+
+          <div class="step"><div class="num">7</div><div><h3>检查健康状态</h3><div class="code"><button class="copy">复制</button><pre>curl http://127.0.0.1:8888/healthz
+pm2 logs lb-server --lines 50
+pm2 logs deploy-server --lines 50</pre></div><p class="small">健康接口正常后，再配置网站反向代理或交付远程更新权限。</p></div></div>
+
+          <div class="step"><div class="num">8</div><div><h3>放行端口</h3><div class="kv"><div>业务端口</div><div><code>8888</code>（按实际配置调整）</div><div>热更新端口</div><div><code>9001</code>（按 <code>DEPLOY_PORT</code> 调整）</div><div>访问策略</div><div>9001 只允许你的固定公网 IP；不要对全网开放</div></div></div></div>
+        </section>
+
+        <section class="section" id="remote">
+          <h2>二、你这边远程操作</h2>
+          <p class="lead">在本地部署包目录执行，把“对方服务器IP”和端口换成实际值。</p>
+          <div class="code"><button class="copy">复制</button><pre># 全量上传并自动重启（不上传目标机 config.json）
+node upload.js --host 对方服务器IP --port 9001 --token 安装时生成的随机Token --all
+
+# 查看状态
+node control.js --host 对方服务器IP --port 9001 --token 安装时生成的随机Token status
+
+# 健康检查
+node control.js --host 对方服务器IP --port 9001 --token 安装时生成的随机Token health
+
+# 重启主服务
+node control.js --host 对方服务器IP --port 9001 --token 安装时生成的随机Token restart
+
+# 重新加载受控服务
+node control.js --host 对方服务器IP --port 9001 --token 安装时生成的随机Token reload</pre></div>
+          <div class="ok"><b>交互式更新</b>Windows 可以运行 <code>push.ps1</code>，它会询问目标 IP、端口和 Token；端口留空默认 7879，Token 必须填写目标服务器生成的随机值。</div>
+          <h3>修改 Token</h3><p class="muted">首次确认部署正常后，建议把 <code>.deploy.env</code> 中的 Token 换成长随机字符串，然后：</p>
+          <div class="code"><button class="copy">复制</button><pre>cd /www/wwwroot/universal-http-relay
+pm2 restart deploy-server --update-env
+pm2 save</pre></div>
+        </section>
+
+        <section class="section" id="reliability">
+          <h2>三、请求可靠性说明</h2>
+          <p class="lead">针对接口需要 5～6 秒初始化的问题，程序按“等待当前请求完成”设计。</p>
+          <div class="grid"><div class="ok"><b>不会因 5 秒无响应就切下一个</b>转发层默认最长等待 120 秒；只有真正超时、连接失败或客户端主动断开才结束当前请求。</div><div class="note"><b>超时可以调大</b>管理面板的后端最长等待范围是 60～600 秒，适合更慢的初始化接口。</div></div>
+          <h3>真实请求链路</h3>
+          <div class="kv"><div>1. 客户端发起</div><div>负载均衡器接收并保持当前请求</div><div>2. 选择节点</div><div>健康节点收到转发，不会因短暂初始化立即丢弃</div><div>3. 等待响应</div><div>持续读取完整 HTTP 响应，支持 Content-Length、chunked 和分片数据</div><div>4. 返回客户端</div><div>完整响应返回后结束本次请求</div></div>
+          <div class="danger" style="margin-top:15px"><b>必须分清</b>“不丢请求”不等于无限等待。上游断开、客户端主动取消或超过最大等待时间时，程序仍会结束并记录错误。</div>
+        </section>
+
+        <section class="section" id="troubleshoot">
+          <h2>四、常见问题</h2>
+          <details><summary>pm2 status 没有 deploy-server</summary><p>确认当前目录正确，执行 <code>pm2 start ecosystem.config.js</code>；仍失败就看 <code>pm2 logs deploy-server --lines 100</code>。</p></details>
+          <details><summary>本地 control.js 连接不上</summary><p>检查云安全组和宝塔防火墙是否放行热更新端口；确认 <code>DEPLOY_BIND=0.0.0.0</code>、端口和 Token 一致。不要把热更新端口放在只支持 HTTP 的普通反代后面。</p></details>
+          <details><summary>网页能打开，但原始 TCP/FRP 不通</summary><p>普通 Nginx HTTP 反代只适合网页和 HTTP 转发。原始 TCP/FRP 需要 Node 直接监听对应端口，或使用 Nginx stream/TCP 转发。</p></details>
+          <details><summary>更新后服务没有起来</summary><p>先执行 <code>pm2 status</code> 和 <code>pm2 logs lb-server --lines 100</code>。更新流程保留备份，可在确认故障后回滚；不要覆盖目标机生产 <code>config.json</code>。</p></details>
+          <details><summary>如何只重启，不上传代码</summary><p>使用 <code>control.js ... restart</code>；更新代码使用 <code>upload.js ... --all</code>。</p></details>
+        </section>
+
+        <section class="section" id="ai">
+          <h2>五、直接交给对方 AI 的提示词</h2>
+          <p class="lead">把下面整段复制给他的 AI，再把部署包一起提供。AI 应先检查环境和目录，再执行命令，不要猜路径。</p>
+          <textarea id="aiPrompt" readonly>你是这台 Linux 宝塔服务器的部署助手。请部署“Universal HTTP Relay v2.1.0”。
+
+要求：
+1. 项目是 Node.js + Express，不是 PHP；Node.js 必须 >=18。
+2. 项目目录使用 /www/wwwroot/universal-http-relay；如果目录不存在就创建，但不要删除已有 config.json、日志或备份。
+3. 先检查 node -v、npm -v、当前目录和 package.json，再执行 npm ci --omit=dev。
+4. 如果 config.json 不存在，执行 node scripts/init-config.js，并把输出的管理员密码和 Agent Token 提醒我保存；不要在聊天中泄露已有 config.json 内容。
+5. 在项目根目录创建或检查 .deploy.env，内容为：
+   DEPLOY_BASE_DIR=/www/wwwroot/universal-http-relay
+   DEPLOY_BIND=0.0.0.0
+   DEPLOY_PORT=9001
+   DEPLOY_TOKEN=安装时生成的随机Token
+   DEPLOY_SERVICE_MANAGER=pm2
+   DEPLOY_PROCESS_NAME=lb-server
+6. 执行 chmod 600 .deploy.env，然后用 PM2 启动 ecosystem.config.js；确认 lb-server 和 deploy-server 都在线，并执行 pm2 save。
+7. 把初始化输出的 ADMIN_PASSWORD、AGENT_TOKEN 分别提醒我保存。后台登录地址是 http://服务器IP:8888/，后台没有用户名；远程部署 Token 与后台密码是两套独立的随机凭据。
+8. 检查 curl http://127.0.0.1:8888/healthz，并报告实际监听端口、PM2 状态和错误日志摘要。
+9. 提醒管理员在宝塔防火墙/云安全组放行业务端口 8888 和热更新端口 9001，但只允许指定管理 IP 访问 9001。
+10. 远程控制只允许 status、health、restart、reload；不要执行任意 Shell，也不要执行与本项目无关的删除、格式化、重装系统、修改 SSH 或开放全网端口的操作。
+11. 这个服务必须等待慢接口完成：不要把 5～6 秒初始化误判成失败。默认请求最长等待 120 秒；如果检查配置，确认 request_timeout 不低于 60000。
+
+执行完后请按“已完成 / 未完成 / 需要我确认”三部分汇报，并附上可复现的检查命令。</textarea>
+          <div style="margin-top:12px"><button class="copy" style="position:static" data-copy-target="aiPrompt">复制整段提示词</button></div>
+        </section>
+
+        <section class="section" id="check">
+          <h2>六、上线前检查</h2>
+          <p class="lead">逐项打勾后再把服务器交给使用方。</p>
+          <div class="checklist"><label class="check"><input type="checkbox"> Node.js 版本 >= 18</label><label class="check"><input type="checkbox"> npm ci 已成功完成</label><label class="check"><input type="checkbox"> 管理员密码和 Agent Token 已保存</label><label class="check"><input type="checkbox"> lb-server 与 deploy-server 都在线</label><label class="check"><input type="checkbox"> /healthz 返回正常</label><label class="check"><input type="checkbox"> 8888 业务端口已按需放行</label><label class="check"><input type="checkbox"> 9001 只允许管理 IP 访问</label><label class="check"><input type="checkbox"> 已用 status、health、restart 测试远程控制</label><label class="check"><input type="checkbox"> 已测试 5～6 秒慢初始化接口</label><label class="check"><input type="checkbox"> 已保存 pm2 save 并配置开机启动</label></div>
+          <div class="note" style="margin-top:18px"><b>交付建议</b>首次部署可以使用远程 Token <code>安装时生成的随机Token</code> 跑通流程；确认成功后立即更换随机长 Token，并把热更新端口限制为你的固定 IP。</div>
+        </section>
+      </main>
+    </div>
+    <div class="footer">Universal HTTP Relay · Linux / 宝塔部署手册 · 页面可离线打开</div>
+  </div>
+  <script>
+    document.querySelectorAll('.copy').forEach(function(button){
+      button.addEventListener('click', async function(){
+        var text=button.dataset.copy;
+        if(button.dataset.copyTarget){text=document.getElementById(button.dataset.copyTarget).value}
+        if(!text){var pre=button.parentElement.querySelector('pre');text=pre?pre.textContent:''}
+        try{await navigator.clipboard.writeText(text);button.textContent='已复制';button.classList.add('done');setTimeout(function(){button.textContent='复制';button.classList.remove('done')},1400)}
+        catch(e){button.textContent='请手动复制';setTimeout(function(){button.textContent='复制'},1600)}
+      })
+    })
+  </script>
+</body>
+</html>

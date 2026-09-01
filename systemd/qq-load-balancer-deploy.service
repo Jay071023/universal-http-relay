@@ -1,0 +1,25 @@
+[Unit]
+Description=QQ Load Balancer Hot Update Receiver
+After=network-online.target qq-load-balancer.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=@APP_DIR@
+EnvironmentFile=/etc/qq-load-balancer/deploy.env
+ExecStart=@NODE_BIN@ @APP_DIR@/deploy-server.js
+Restart=always
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=@APP_DIR@
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

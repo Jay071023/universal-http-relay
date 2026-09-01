@@ -1,0 +1,713 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>负载均衡管理面板</title>
+  <link rel="stylesheet" href="/css/style.css">
+  <script>{
+    const t = localStorage.getItem('lb_theme');
+    if (t === 'dark' || (!t && matchMedia('(prefers-color-scheme:dark)').matches))
+      document.documentElement.setAttribute('data-theme','dark');
+    // 有 token 立即隐藏登录遮罩，避免刷新闪现
+    if (localStorage.getItem('lb_token')) document.write('<style>.login-overlay{display:none!important}</style>');
+  }</script>
+  <script src="/lib/chart.umd.min.js" defer></script>
+  <script src="/js/app.js?v=20260901" defer></script>
+</head>
+<body>
+  <!-- ====== 登录遮罩 ====== -->
+  <div class="login-overlay" id="loginOverlay">
+    <div class="login-card">
+      <div class="login-icon">
+        <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="var(--primary)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20V10"/><path d="M18 20V4"/><path d="M6 20v-4"/></svg>
+      </div>
+      <h2 class="login-title" id="loginTitle">负载均衡管理面板</h2>
+      <p class="login-subtitle">请输入管理员密码</p>
+      <input type="password" id="loginPassword" class="form-input login-input" placeholder="管理员密码" autocomplete="current-password" spellcheck="false">
+      <div class="login-error" id="loginError" style="display:none"></div>
+      <button class="btn btn-primary login-btn" id="loginBtn">登 录</button>
+    </div>
+  </div>
+
+  <!-- ====== Toast 容器 ====== -->
+  <div class="toast-container" id="toastContainer"></div>
+
+  <!-- ====== 顶部导航栏 ====== -->
+  <nav class="navbar">
+    <div class="nav-inner">
+      <div class="nav-brand">
+        <svg class="brand-svg" width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="var(--primary)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20V10"/><path d="M18 20V4"/><path d="M6 20v-4"/></svg>
+        <div class="brand-text">
+          <span class="brand-title" id="brandTitle">负载均衡器</span>
+          <span class="brand-subtitle">HTTP Load Balancer</span>
+        </div>
+      </div>
+      <button class="nav-toggle" id="navToggle" aria-label="切换菜单">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <div class="nav-stats" id="navStats">
+        <div class="nav-stat-item">
+          <span class="nav-stat-dot pulse green" id="navStatusDot"></span>
+          <span class="nav-stat-label" id="navNodesOnline">0</span>
+          <span class="nav-stat-unit">节点在线</span>
+        </div>
+        <div class="nav-stat-divider"></div>
+        <div class="nav-stat-item">
+          <span class="nav-stat-value" id="navTotalReqs">0</span>
+          <span class="nav-stat-unit">总请求</span>
+        </div>
+        <div class="nav-stat-divider"></div>
+        <div class="nav-stat-item">
+          <span class="nav-stat-value" id="navAlgorithm">轮询</span>
+          <span class="nav-stat-unit">当前算法</span>
+        </div>
+        <div class="nav-stat-divider"></div>
+        <button class="btn btn-icon btn-theme" id="themeToggle" title="切换主题">
+          <svg class="theme-sun" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+          <svg class="theme-moon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+        </button>
+        <button class="btn btn-danger btn-xs" id="logoutBtn" style="display:none">退出</button>
+      </div>
+    </div>
+  </nav>
+
+  <!-- ====== 主内容 ====== -->
+  <main class="main">
+    <div class="container">
+
+      <!-- ====== 运维概览头部 ====== -->
+      <section class="overview-hero" aria-label="运行概览">
+        <div class="hero-copy">
+          <div class="eyebrow"><span class="eyebrow-dot"></span>实时运行中心</div>
+          <h1 id="dashboardGreeting">负载均衡控制台</h1>
+          <p id="dashboardSubtext">集中查看节点健康、流量和 Agent 连接状态。</p>
+        </div>
+        <div class="hero-meta">
+          <div class="service-state syncing" id="serviceState" aria-live="polite">
+            <span class="service-state-dot" id="serviceStateDot"></span>
+            <span class="service-state-copy">
+              <strong id="serviceStatusText">准备同步</strong>
+              <small id="serviceStatusSub">等待服务响应</small>
+            </span>
+          </div>
+          <div class="hero-actions">
+            <span class="last-updated" id="lastUpdated" title="数据更新时间">尚未同步</span>
+            <button class="btn btn-secondary btn-sm" id="refreshOverviewBtn" type="button" title="刷新概览（快捷键 R）">
+              <span class="btn-refresh-icon" aria-hidden="true">↻</span> 刷新
+            </button>
+            <button class="btn btn-secondary btn-sm" id="quickExportBtn" type="button">导出配置</button>
+            <button class="btn btn-primary btn-sm" id="quickBackupBtn" type="button">立即备份</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ====== 顶部概览卡片 ====== -->
+      <section class="stats-row" id="statsRow">
+        <div class="stat-card">
+          <div class="stat-card-icon blue">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="var(--primary)" stroke-width="2" stroke-linecap="round"><path d="M12 20V10"/><path d="M18 20V4"/><path d="M6 20v-4"/></svg>
+          </div>
+          <div class="stat-card-body">
+            <div class="stat-card-value" id="statTotalRequests">0</div>
+            <div class="stat-card-label">总请求数</div>
+          </div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-card-icon green">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="var(--success)" stroke-width="2" stroke-linecap="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+          </div>
+          <div class="stat-card-body">
+            <div class="stat-card-value" id="statOnlineNodes">0 <small>/ 0</small></div>
+            <div class="stat-card-label">在线节点 / 总数</div>
+          </div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-card-icon" style="background:linear-gradient(135deg,#f3e8ff,#ede9fe)">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="var(--primary)" stroke-width="2" stroke-linecap="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+          </div>
+          <div class="stat-card-body">
+            <div class="stat-card-value" id="statRps">0</div>
+            <div class="stat-card-label">每秒请求数</div>
+          </div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-card-icon orange">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="var(--warning)" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+          </div>
+          <div class="stat-card-body">
+            <div class="stat-card-value" id="statAvgResponse">0ms</div>
+            <div class="stat-card-label">平均响应时间</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ====== QQ 统计卡片 ====== -->
+      <section class="stats-row" id="qqStatsRow">
+        <div class="stat-card" style="background:linear-gradient(135deg,#fce7f3,#fbcfe8)">
+          <div class="stat-card-icon" style="background:linear-gradient(135deg,#fdf2f8,#fce7f3)">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#db2777" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>
+          </div>
+          <div class="stat-card-body">
+            <div class="stat-card-value" id="statTotalQq" style="color:#db2777">0</div>
+            <div class="stat-card-label">去重 QQ 总数</div>
+          </div>
+        </div>
+        <div class="stat-card" style="background:linear-gradient(135deg,#f3e8ff,#ede9fe)">
+          <div class="stat-card-icon" style="background:linear-gradient(135deg,#f5f3ff,#ede9fe)">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#7c3aed" stroke-width="2" stroke-linecap="round"><path d="M2 12h2"/><path d="M6 12h2"/><path d="M10 12h2"/><path d="M14 12h2"/><path d="M18 12h2"/><path d="M22 12h2"/><circle cx="12" cy="12" r="10"/></svg>
+          </div>
+          <div class="stat-card-body">
+            <div class="stat-card-value" id="statTodayQq" style="color:#7c3aed">0</div>
+            <div class="stat-card-label">今日去重 QQ</div>
+          </div>
+        </div>
+        <div class="stat-card" style="background:linear-gradient(135deg,#d1fae5,#a7f3d0)">
+          <div class="stat-card-icon" style="background:linear-gradient(135deg,#ecfdf5,#d1fae5)">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#059669" stroke-width="2" stroke-linecap="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+          </div>
+          <div class="stat-card-body">
+            <div class="stat-card-value" id="statQqRequests" style="color:#059669">0</div>
+            <div class="stat-card-label">QQ 请求总数</div>
+          </div>
+        </div>
+        <div class="stat-card" style="background:linear-gradient(135deg,#dbeafe,#bfdbfe)">
+          <div class="stat-card-icon" style="background:linear-gradient(135deg,#eff6ff,#dbeafe)">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#2563eb" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/></svg>
+          </div>
+          <div class="stat-card-body">
+            <div class="stat-card-value" id="statMaxDaily" style="color:#2563eb">-</div>
+            <div class="stat-card-label">峰值新增/分钟</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ====== QQ 实时图表 ====== -->
+      <section class="card" id="qqChartSection">
+        <div class="card-header">
+          <h2 class="card-title">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ec4899" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>
+            QQ 去重统计
+          </h2>
+          <div class="card-actions">
+            <span class="card-action-hint">近 60 秒新增去重 QQ 数</span>
+            <div class="chart-legend">
+              <span class="legend-item"><span class="legend-dot" style="background:#ec4899"></span>新增 QQ</span>
+            </div>
+          </div>
+        </div>
+        <div class="chart-wrapper" style="height:200px">
+          <canvas id="qqChartCanvas"></canvas>
+        </div>
+      </section>
+
+      <!-- ====== 算法选择 ====== -->
+      <section class="card" id="algorithmSection">
+        <div class="card-header">
+          <h2 class="card-title">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+            负载均衡算法
+          </h2>
+          <div class="card-actions">
+            <span class="card-badge" id="currentAlgoBadge">轮询</span>
+            <select id="algoGroupSelector" class="form-input algo-selector"></select>
+          </div>
+        </div>
+        <p class="card-desc">选择不同分组，每个分组可独立设置算法</p>
+        <div class="algo-grid" id="algoGrid"></div>
+      </section>
+
+      <!-- ====== 实时流量图表 ====== -->
+      <section class="card">
+        <div class="card-header">
+          <h2 class="card-title">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+            实时请求流量
+          </h2>
+          <div class="card-actions">
+            <span class="card-action-hint" id="chartHint">近60秒请求量</span>
+            <div class="chart-legend">
+              <span class="legend-item"><span class="legend-dot" style="background:#6366f1"></span>请求数</span>
+              <span class="legend-item"><span class="legend-dot" style="background:#f97316"></span>响应时间(ms)</span>
+            </div>
+          </div>
+        </div>
+        <div class="chart-wrapper">
+          <canvas id="chartCanvas"></canvas>
+        </div>
+      </section>
+
+      <!-- ====== frpc Agent 配置面板 ====== -->
+      <section class="card" id="frpcConfig">
+        <div class="card-header">
+          <h2 class="card-title">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><path d="M6 6h.01M6 18h.01"/></svg>
+            frpc Agent 配置
+          </h2>
+          <span class="card-badge" style="background:#f3e8ff;color:#6b21a8">frps 内置 :6666/agent</span>
+        </div>
+        <p class="card-desc">下方配置对应 frpc 连接参数。Agent 启动后会自动注册，可在网页修改分组和权重。</p>
+
+        <div class="frpc-layout">
+          <div class="frpc-info">
+            <div class="frpc-info-header">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/></svg>
+              服务器连接配置
+            </div>
+            <div class="frpc-fields">
+              <div class="form-group">
+                <label>serverAddr（负载均衡器地址）</label>
+                <input type="text" id="cfgServerAddr" class="form-input" readonly style="font-family:monospace">
+              </div>
+              <div class="form-row" style="gap:12px">
+                <div class="form-group" style="flex:1">
+                  <label>Web 端口</label>
+                  <input type="text" id="cfgServerPort" class="form-input" readonly style="font-family:monospace" value="8888">
+                </div>
+                <div class="form-group" style="flex:1">
+                  <label>frps TCP 端口</label>
+                  <input type="text" id="cfgFrpPort" class="form-input" readonly style="font-family:monospace" value="7000">
+                </div>
+              </div>
+              <div class="form-group">
+                <label>auth.token（Agent/frpc 认证密码，留空不鉴权）</label>
+                <input type="text" id="cfgAgentToken" class="form-input" placeholder="设置后 Agent/frpc 必须携带此 token" style="font-family:monospace">
+              </div>
+            </div>
+          </div>
+
+          <div class="frpc-commands">
+            <div class="frpc-commands-header">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/><polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/><line x1="4" y1="4" x2="9" y2="9"/></svg>
+              <div>
+                <div class="frpc-commands-title">连接命令（自动生成）</div>
+                <div class="frpc-commands-sub">复制后在目标服务器运行</div>
+              </div>
+            </div>
+            <div class="cmd-block">
+              <div class="cmd-block-title">
+                <span class="cmd-label">Agent (WebSocket)</span>
+                <button class="btn btn-xs btn-ghost" id="cfgCopyCmd">复制</button>
+              </div>
+              <pre id="cfgAgentCmd" class="cmd-pre"></pre>
+            </div>
+            <div class="cmd-block">
+              <div class="cmd-block-title">
+                <span class="cmd-label">frpc (TCP 标准协议)</span>
+                <button class="btn btn-xs btn-ghost" id="cfgCopyFrpcCmd">复制</button>
+              </div>
+              <pre id="cfgFrpcCmd" class="cmd-pre"></pre>
+            </div>
+          </div>
+        </div>
+
+        <div class="section-title">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/></svg>
+          预配置 Agent 代理
+        </div>
+        <button class="btn btn-primary btn-sm" id="showAddProxyBtn" style="margin-bottom:12px">+ 预配置代理</button>
+        <div class="add-backend-form" id="addProxyForm" style="display:none">
+          <div class="form-row">
+            <div class="form-group form-group-sm"><label>name</label><input type="text" id="newProxyName" placeholder="qsign1" class="form-input"></div>
+            <div class="form-group form-group-sm"><label>分组</label><select id="newProxyGroup" class="form-input"></select></div>
+            <div class="form-group form-group-sm"><label>groupKey</label><input type="text" id="newProxyKey" placeholder="example-group" class="form-input"></div>
+            <div class="form-group form-group-sm"><label>本地端口</label><input type="number" id="newProxyPort" placeholder="11475" class="form-input"></div>
+            <div class="form-group form-group-btn"><label>&nbsp;</label><button class="btn btn-primary" id="addProxyBtn">添加</button><button class="btn btn-secondary" id="cancelAddProxyBtn">取消</button></div>
+          </div>
+        </div>
+        <div id="proxyList"></div>
+
+        <div class="section-title" style="margin-top:20px">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+          已连接的 Agent 节点
+        </div>
+        <div class="table-responsive">
+          <table class="table" id="agentTable">
+            <thead><tr>
+              <th>状态</th><th>名称</th><th>来源IP</th><th>分组</th><th>权重</th><th>连接时间</th><th>请求数</th><th>响应时间</th><th>操作</th>
+            </tr></thead>
+            <tbody id="agentTableBody"></tbody>
+          </table>
+        </div>
+        <div class="table-empty" id="agentEmpty">
+          <div class="empty-icon">
+            <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>
+          </div>
+          <div class="empty-text">暂无 Agent 连接，请在目标服务器运行 agent.js</div>
+        </div>
+      </section>
+
+      <!-- ====== 后端节点管理 ====== -->
+      <section class="card" id="backendSection">
+        <div class="card-header">
+          <h2 class="card-title">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><path d="M6 6h.01M6 18h.01"/></svg>
+            后端节点管理
+          </h2>
+          <button class="btn btn-primary btn-sm" id="showAddBackendBtn">+ 添加节点</button>
+        </div>
+        <div class="backend-toolbar" role="toolbar" aria-label="节点筛选工具">
+          <label class="search-box" for="backendSearch">
+            <span aria-hidden="true">⌕</span>
+            <input id="backendSearch" type="search" placeholder="搜索地址、标签或分组" autocomplete="off" spellcheck="false">
+          </label>
+          <div class="filter-tabs" role="group" aria-label="节点状态筛选">
+            <button class="filter-tab active" type="button" data-backend-filter="all">全部 <span id="backendCountAll">0</span></button>
+            <button class="filter-tab" type="button" data-backend-filter="online">在线 <span id="backendCountOnline">0</span></button>
+            <button class="filter-tab" type="button" data-backend-filter="offline">离线 <span id="backendCountOffline">0</span></button>
+          </div>
+          <span class="toolbar-result" id="backendVisibleCount" aria-live="polite">显示 0 个节点</span>
+        </div>
+        <div class="add-backend-form" id="addBackendForm" style="display:none">
+          <div class="form-row">
+            <div class="form-group">
+              <label>后端地址</label>
+              <input type="text" id="newBackendUrl" placeholder="http://192.168.1.100:8080" class="form-input">
+            </div>
+            <div class="form-group form-group-sm">
+              <label>权重</label>
+              <input type="number" id="newBackendWeight" value="1" min="1" max="100" class="form-input">
+            </div>
+            <div class="form-group form-group-sm">
+              <label>分组</label>
+              <select id="newBackendGroup" class="form-input"></select>
+            </div>
+            <div class="form-group">
+              <label>标签</label>
+              <input type="text" id="newBackendTag" placeholder="例如: 主服务器" class="form-input">
+            </div>
+            <div class="form-group form-group-btn">
+              <label>&nbsp;</label>
+              <button class="btn btn-primary" id="addBackendBtn">添加</button>
+              <button class="btn btn-secondary" id="cancelAddBackendBtn">取消</button>
+            </div>
+          </div>
+        </div>
+        <div class="table-responsive">
+          <table class="table" id="backendTable">
+            <thead><tr>
+              <th>状态</th><th>类型</th><th>地址/标识</th><th>分组</th><th>权重</th><th>标签</th><th>连接数</th><th>响应时间</th><th>请求数</th><th>操作</th>
+            </tr></thead>
+            <tbody id="backendTableBody"></tbody>
+          </table>
+        </div>
+        <div class="table-empty" id="backendEmpty">
+          <div class="empty-icon">
+            <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/></svg>
+          </div>
+          <div class="empty-text">暂无后端节点，请点击上方「添加节点」</div>
+        </div>
+      </section>
+
+      <!-- ====== 请求分发日志 ====== -->
+      <section class="card">
+        <div class="card-header">
+          <h2 class="card-title">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+            请求分发日志
+          </h2>
+          <span class="card-badge secondary" id="logCount">实时</span>
+        </div>
+        <div class="logs-wrapper">
+          <table class="table table-logs" id="logTable">
+            <thead><tr>
+              <th>时间</th><th>方法</th><th>路径</th><th>分组</th><th>目标节点</th><th>算法</th><th>状态</th><th>耗时</th>
+            </tr></thead>
+            <tbody id="logTableBody"></tbody>
+          </table>
+        </div>
+        <div class="table-empty" id="logEmpty">
+          <div class="empty-icon">
+            <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+          </div>
+          <div class="empty-text">暂无请求日志</div>
+        </div>
+      </section>
+
+      <!-- ====== 后端分组管理 ====== -->
+      <section class="card" id="groupsSection">
+        <div class="card-header">
+          <h2 class="card-title">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+            后端分组管理
+          </h2>
+          <button class="btn btn-primary btn-sm" id="showAddGroupBtn">+ 新建分组</button>
+        </div>
+        <p class="card-desc">不同分组可使用不同算法，通过路由规则将请求分发到指定分组</p>
+        <div class="add-group-form" id="addGroupForm" style="display:none">
+          <div class="form-row">
+            <div class="form-group">
+              <label>分组名称</label>
+              <input type="text" id="newGroupName" placeholder="如: api-servers" class="form-input">
+            </div>
+            <div class="form-group">
+              <label>描述</label>
+              <input type="text" id="newGroupDesc" placeholder="如: API服务集群" class="form-input">
+            </div>
+            <div class="form-group form-group-sm">
+              <label>算法</label>
+              <select id="newGroupAlgo" class="form-input"></select>
+            </div>
+            <div class="form-group form-group-btn">
+              <label>&nbsp;</label>
+              <button class="btn btn-primary" id="addGroupBtn">创建</button>
+              <button class="btn btn-secondary" id="cancelAddGroupBtn">取消</button>
+            </div>
+          </div>
+        </div>
+        <div id="groupsList"></div>
+      </section>
+
+      <!-- ====== 路由规则 ====== -->
+      <section class="card" id="rulesSection">
+        <div class="card-header">
+          <h2 class="card-title">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+            路由规则
+          </h2>
+          <button class="btn btn-primary btn-sm" id="showAddRuleBtn">+ 添加规则</button>
+        </div>
+        <p class="card-desc">根据请求路径匹配规则，将流量路由到指定分组。优先级高的规则先匹配。</p>
+        <div class="add-rule-form" id="addRuleForm" style="display:none">
+          <div class="form-row">
+            <div class="form-group">
+              <label>路径前缀</label>
+              <input type="text" id="newRulePath" placeholder="/api/" class="form-input">
+              <span class="form-hint" id="rulePathHint">前缀匹配，如 /api/</span>
+            </div>
+            <div class="form-group form-group-sm">
+              <label>匹配类型</label>
+              <select id="newRuleMatchType" class="form-input" onchange="updateRulePathHint()">
+                <option value="prefix">前缀匹配</option>
+                <option value="query">查询参数</option>
+                <option value="json">JSON字段</option>
+              </select>
+              <span class="form-hint" style="visibility:hidden">占位</span>
+            </div>
+            <div class="form-group form-group-sm">
+              <label>目标分组</label>
+              <select id="newRuleGroup" class="form-input"></select>
+              <span class="form-hint" style="visibility:hidden">占位</span>
+            </div>
+            <div class="form-group form-group-sm">
+              <label>优先级</label>
+              <input type="number" id="newRulePriority" value="10" class="form-input">
+              <span class="form-hint">数字越大越先匹配</span>
+            </div>
+            <div class="form-group form-group-btn">
+              <label>&nbsp;</label>
+              <button class="btn btn-primary" id="addRuleBtn">添加</button>
+              <button class="btn btn-secondary" id="cancelAddRuleBtn">取消</button>
+            </div>
+          </div>
+        </div>
+        <div id="rulesList"></div>
+      </section>
+
+      <!-- ====== 系统设置 ====== -->
+      <section class="card" id="settingsSection">
+        <div class="card-header">
+          <h2 class="card-title">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33A1.65 1.65 0 0 0 13 19.4V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 7 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+            系统设置
+          </h2>
+          <div class="card-actions" style="display:flex;gap:6px;flex-wrap:wrap">
+            <button class="btn btn-sm btn-secondary" onclick="exportConfig()">📥 导出配置</button>
+            <label class="btn btn-sm btn-secondary" style="cursor:pointer;margin:0">
+              📤 导入配置
+              <input type="file" id="importConfigInput" accept=".json" style="display:none" onchange="importConfig(event)">
+            </label>
+          </div>
+          <span class="card-badge secondary" id="settingsStatus">已保存</span>
+        </div>
+        <div class="settings-form" style="display:flex;flex-direction:column;gap:14px">
+
+          <!-- 基础 -->
+          <div class="settings-group">
+            <div class="settings-group-title">🔐 认证 & 端口</div>
+            <div class="settings-row">
+              <div class="settings-item">
+                <label>Agent 认证密码</label>
+                <input type="text" id="setAgentToken" placeholder="留空=不鉴权" class="form-input">
+              </div>
+              <div class="settings-item" style="max-width:180px">
+                <label>frps TCP 端口</label>
+                <input type="number" id="setFrpPort" class="form-input" placeholder="7000">
+              </div>
+              <div class="settings-item" style="max-width:180px">
+                <label>管理员密码</label>
+                <input type="password" id="setAdminPassword" placeholder="留空=不修改" class="form-input">
+              </div>
+            </div>
+          </div>
+
+          <!-- 探测 & 超时 -->
+          <div class="settings-group">
+            <div class="settings-group-title">⏱️ 探测 & 超时</div>
+            <div class="settings-row">
+              <div class="settings-item" style="max-width:180px">
+                <label>健康检查间隔 (ms)</label>
+                <input type="number" id="setHcInterval" class="form-input">
+              </div>
+              <div class="settings-item" style="max-width:180px">
+                <label>健康检查超时 (ms)</label>
+                <input type="number" id="setHcTimeout" class="form-input">
+              </div>
+              <div class="settings-item" style="max-width:180px">
+                <label>隧道请求超时 (ms)</label>
+                <input type="number" id="setTunnelTimeout" class="form-input">
+              </div>
+              <div class="settings-item" style="max-width:200px">
+                <label>后端最长等待 (ms)</label>
+                <input type="number" id="setRequestTimeout" min="60000" max="600000" step="1000" class="form-input">
+                <small class="form-hint">至少 60000ms，覆盖慢初始化接口</small>
+              </div>
+              <div class="settings-item" style="max-width:160px">
+                <label>日志保留数</label>
+                <input type="number" id="setMaxLog" class="form-input">
+              </div>
+            </div>
+          </div>
+
+          <!-- 400 重试 -->
+          <div class="settings-group">
+            <div class="settings-group-title">🔄 400 自动重试</div>
+            <div class="settings-row" style="align-items:center">
+              <label class="settings-toggle">
+                <input type="checkbox" id="setRetry400" class="toggle-input">
+                <span class="toggle-slider"></span>
+                <span class="toggle-text">后端返回 400 时自动重试（先同节点 N 次，再换节点）</span>
+              </label>
+              <div class="settings-item" style="max-width:160px;margin-left:auto">
+                <label>同节点重试次数</label>
+                <input type="number" id="setRetry400Max" min="1" max="10" placeholder="2" class="form-input">
+              </div>
+            </div>
+          </div>
+
+          <!-- 版本改写 -->
+          <div class="settings-group">
+            <div class="settings-group-title">🪄 ver 参数改写</div>
+            <div class="settings-row" style="align-items:center">
+              <label class="settings-toggle">
+                <input type="checkbox" id="setVersionRewrite" class="toggle-input">
+                <span class="toggle-slider"></span>
+                <span class="toggle-text">将请求中的 ver 参数统一改写为目标版本</span>
+              </label>
+              <div class="settings-item" style="max-width:160px;margin-left:auto">
+                <label>目标版本</label>
+                <input type="text" id="setVersionTarget" placeholder="9.2.70" class="form-input">
+              </div>
+            </div>
+          </div>
+
+          <!-- 数据持久化 -->
+          <div class="settings-group">
+            <div class="settings-group-title">💾 数据持久化</div>
+            <div class="settings-row" style="flex-wrap:wrap;gap:24px">
+              <label class="settings-toggle">
+                <input type="checkbox" id="setPersistStats" class="toggle-input">
+                <span class="toggle-slider"></span>
+                <span class="toggle-text">重启后保留统计（QQ 数）</span>
+              </label>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+      <!-- ====== 自动备份管理 ====== -->
+      <section class="card" id="backupsSection">
+        <div class="card-header">
+          <h2 class="card-title">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            配置自动备份
+          </h2>
+          <div class="card-actions">
+            <label class="toggle-label" style="display:flex;align-items:center;gap:8px;padding:6px 12px">
+              <input type="checkbox" id="setAutoBackup" class="toggle-input">
+              <span class="toggle-slider"></span>
+              <span class="toggle-text">定时自动备份</span>
+            </label>
+            <select id="setBackupInterval" class="form-input" style="width:auto;padding:5px 8px;font-size:12px">
+              <option value="3600000">每小时</option>
+              <option value="21600000">每 6 小时</option>
+              <option value="43200000">每 12 小时</option>
+              <option value="86400000">每天</option>
+            </select>
+            <button class="btn btn-sm btn-primary" onclick="backupNow()">立即备份</button>
+            <button class="btn btn-sm btn-secondary" onclick="fetchBackups()">刷新</button>
+          </div>
+        </div>
+        <p class="card-desc">自动备份保存到服务器 <code>backups/</code> 目录，Bark 通知每次新备份。超过 <span id="setMaxBackupsLabel">30</span> 个会自动清理旧的。</p>
+        <div class="table-responsive">
+          <table class="table" id="backupsTable">
+            <thead><tr><th>文件名</th><th>大小</th><th>时间</th><th>操作</th></tr></thead>
+            <tbody id="backupsTableBody"></tbody>
+          </table>
+        </div>
+        <div id="backupsEmpty" class="empty-state">暂无备份，点「立即备份」创建第一个</div>
+      </section>
+
+      <!-- ====== 活动会话（多设备） ====== -->
+      <section class="card" id="sessionsSection">
+        <div class="card-header">
+          <h2 class="card-title">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+            活动会话
+          </h2>
+          <div class="card-actions">
+            <span class="card-badge secondary">最多 20 个设备</span>
+            <button class="btn btn-sm btn-secondary" onclick="fetchSessions()">刷新</button>
+            <button class="btn btn-sm btn-danger" onclick="revokeAllOffline()">清理离线</button>
+          </div>
+        </div>
+        <p class="card-desc">所有已登录的设备（多设备共享同一账号）。点击"注销"可踢出该设备，"清理离线"批量移除所有非活跃会话。</p>
+        <div class="table-responsive">
+          <table class="table" id="sessionsTable">
+            <thead><tr>
+              <th>设备</th><th>IP</th><th>登录时间</th><th>最近活跃</th><th>状态</th><th>操作</th>
+            </tr></thead>
+            <tbody id="sessionsTableBody"></tbody>
+          </table>
+        </div>
+        <div id="sessionsEmpty" class="empty-state">暂无活动会话</div>
+      </section>
+
+    </div>
+  </main>
+
+  <!-- ====== 底部 ====== -->
+  <footer class="footer">
+    <div class="container">
+      <p>HTTP 负载均衡器 v1.0.0 — 实时监控 · 动态节点管理 · 六种算法</p>
+      <p style="margin-top:6px;font-size:11px;opacity:.6">Copyright &copy; JAY. All rights reserved.</p>
+    </div>
+  </footer>
+
+  <!-- ====== 编辑标签对话框 ====== -->
+  <div class="modal-overlay" id="tagModal">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>编辑节点标签</h3>
+        <button class="modal-close" id="tagModalClose">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label>节点地址</label>
+          <input type="text" id="tagModalUrl" disabled class="form-input disabled">
+        </div>
+        <div class="form-group">
+          <label>标签名称</label>
+          <input type="text" id="tagModalInput" placeholder="输入标签名称" class="form-input">
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" id="tagModalCancel">取消</button>
+        <button class="btn btn-primary" id="tagModalSave">保存</button>
+      </div>
+    </div>
+  </div>
+
+</body>
+</html>
