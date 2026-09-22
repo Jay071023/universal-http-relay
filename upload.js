@@ -42,11 +42,15 @@ const DEFAULT_FILES = [
   'lb-server.js',
   'lb-server-real.js',
   'deploy-server.js',
+  'windows-supervisor.js',
   'control.js',
   'agent.js',
   'package.json',
   'package-lock.json',
   'ecosystem.config.js',
+  '启动服务.bat',
+  '启动9L服务.bat',
+  '停止服务.bat',
 ];
 const MAX_UPLOAD_FILE_BYTES = 32 * 1024 * 1024;
 

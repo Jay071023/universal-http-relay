@@ -226,11 +226,15 @@ function processExists(pid) {
   try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; }
 }
 
-function readPid() {
+function readPidFile(filePath) {
   try {
-    const pid = Number.parseInt(fs.readFileSync(PID_FILE, 'utf8').trim(), 10);
+    const pid = Number.parseInt(fs.readFileSync(filePath, 'utf8').trim(), 10);
     return processExists(pid) ? pid : null;
   } catch (_) { return null; }
+}
+
+function readPid() {
+  return readPidFile(PID_FILE);
 }
 
 function waitForProcessExit(pid, timeoutMs) {
@@ -277,6 +281,14 @@ async function restartWithPm2() {
 }
 
 async function restartWithPidfile() {
+  const supervisorPath = path.join(BASE_DIR, 'windows-supervisor.js');
+  const supervisorPidFile = path.join(BASE_DIR, 'lb-server.supervisor.pid');
+  const useWindowsSupervisor = process.platform === 'win32' && fs.existsSync(supervisorPath);
+  const oldSupervisorPid = useWindowsSupervisor ? readPidFile(supervisorPidFile) : null;
+  if (oldSupervisorPid && oldSupervisorPid !== process.pid) {
+    try { process.kill(oldSupervisorPid, 'SIGTERM'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+    if (!(await waitForProcessExit(oldSupervisorPid, 10000))) throw new Error(`旧 Windows supervisor 未在超时内退出（PID ${oldSupervisorPid}）`);
+  }
   const oldPid = readPid();
   if (oldPid && oldPid !== process.pid) {
     try { process.kill(oldPid, 'SIGTERM'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
@@ -284,16 +296,24 @@ async function restartWithPidfile() {
   }
   const lbPath = path.join(BASE_DIR, 'lb-server.js');
   if (!fs.existsSync(lbPath)) throw new Error('lb-server.js 不存在');
-  const child = spawn(process.execPath, [lbPath], {
+  const childArgs = useWindowsSupervisor
+    ? [supervisorPath, '--service', 'lb-server']
+    : [lbPath];
+  const child = spawn(process.execPath, childArgs, {
     cwd: BASE_DIR,
     detached: true,
     stdio: 'ignore',
     windowsHide: true,
-    env: { ...process.env, LB_PORT: String(LB_PORT), LB_PID_FILE: PID_FILE }
+    env: {
+      ...process.env,
+      LB_PORT: String(LB_PORT),
+      LB_PID_FILE: PID_FILE,
+      ...(useWindowsSupervisor ? { LB_SUPERVISOR_PID_FILE: supervisorPidFile } : {})
+    }
   });
   child.unref();
   if (!(await waitForHealth())) throw new Error(`新服务健康检查未通过（PID ${child.pid}）`);
-  return { manager: 'pidfile', pid: child.pid };
+  return { manager: 'pidfile', pid: child.pid, supervised: useWindowsSupervisor };
 }
 
 async function restartLbServer() {

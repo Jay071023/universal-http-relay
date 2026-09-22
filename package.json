@@ -8,7 +8,8 @@
     "deploy-server": "node deploy-server.js",
     "upload": "node upload.js",
     "control": "node control.js",
-    "test": "node --test tests/adversarial.test.js"
+    "test": "node --test tests/adversarial.test.js tests/stats-regression.test.js",
+    "test:ui": "node tests/ui-regression.cjs"
   },
   "engines": {
     "node": ">=18"

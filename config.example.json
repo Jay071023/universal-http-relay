@@ -21,6 +21,9 @@
   "retry_400_enabled": true,
   "retry_400_max": 2,
   "retry_400_max_backends": 3,
+  "retry_502_enabled": true,
+  "retry_502_max": 2,
+  "retry_502_max_backends": 3,
   "cors_origins": "",
   "groups": {
     "default": {

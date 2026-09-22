@@ -9,6 +9,7 @@ const state = {
   token: localStorage.getItem('lb_token') || null,
   pageTitle: '',
   backendFilter: 'all', backendQuery: '', refreshing: false, lastUpdated: 0,
+  expandedLogIds: new Set(),
 };
 
 const $ = id => document.getElementById(id);
@@ -41,12 +42,14 @@ const dom = {};
  'setVersionRewrite','setVersionTarget',
  'sessionsTableBody','sessionsEmpty',
  'setAutoBackup','setBackupInterval','setMaxBackupsLabel',
- 'setRetry400','setRetry400Max',
+ 'setRetry400','setRetry400Max','setRetry502','setRetry502Max',
  'setAdminPassword',
   'backupsTableBody','backupsEmpty'
   ,'dashboardGreeting','dashboardSubtext','serviceState','serviceStateDot','serviceStatusText','serviceStatusSub',
   'lastUpdated','refreshOverviewBtn','quickExportBtn','quickBackupBtn','backendSearch','backendVisibleCount',
-  'backendCountAll','backendCountOnline','backendCountOffline'
+ 'backendCountAll','backendCountOnline','backendCountOffline'
+  ,'newBackendGroupText','backendGroupsModal','backendGroupsModalTitle','backendGroupsModalClose',
+  'backendGroupsModalCancel','backendGroupsModalSave','backendGroupOptions'
 ].forEach(id => dom[id] = $(id));
 
 function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
@@ -69,10 +72,11 @@ function toggleTheme() {
   html.setAttribute('data-theme', next);
   localStorage.setItem('lb_theme', next);
   // 图表适配主题色
-  if (state.chart) {
+  for (const chart of [state.chart, state.qqChart]) {
+    if (!chart) continue;
     const isDark = next === 'dark';
-    state.chart.options.scales.y.grid.color = isDark ? 'rgba(255,255,255,.06)' : 'rgba(0,0,0,.04)';
-    state.chart.update();
+    chart.options.scales.y.grid.color = isDark ? 'rgba(255,255,255,.06)' : 'rgba(0,0,0,.04)';
+    chart.update('none');
   }
 }
 dom.themeToggle?.addEventListener('click', toggleTheme);
@@ -85,14 +89,26 @@ function updateRulePathHint() {
     ? '例如 /sign?ver=xxx 仅匹配带该查询参数的请求'
     : dom.newRuleMatchType.value === 'json'
     ? '例如 /sign:ver=xxx 仅匹配请求体 JSON 中 ver=xxx 的请求'
+    : dom.newRuleMatchType.value === 'keyword'
+    ? '例如 android；在 URL、请求头或 JSON 文本中包含该词即命中'
+    : dom.newRuleMatchType.value === 'header'
+    ? '例如 x-client=android；请求头值包含 android 即命中'
+    : dom.newRuleMatchType.value === 'method'
+    ? '例如 POST 或 POST,PUT；匹配请求方法'
     : '前缀匹配，如 /api/';
 }
 
 // ==================== 认证 ====================
-function api(path, opts = {}) {
-  if (!opts.headers) opts.headers = {};
-  if (state.token) opts.headers['Authorization'] = 'Bearer ' + state.token;
-  return fetch(path, opts);
+async function api(path, opts = {}) {
+  const headers = new Headers(opts.headers || {});
+  if (state.token) headers.set('Authorization', 'Bearer ' + state.token);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  try {
+    const response = await fetch(path, { ...opts, headers, signal: opts.signal || controller.signal });
+    if (response.status === 401 && path !== '/api/login') showLogin();
+    return response;
+  } finally { clearTimeout(timeout); }
 }
 
 function doLogin() {
@@ -135,17 +151,20 @@ dom.logoutBtn.addEventListener('click', doLogout);
 
 // ==================== WebSocket ====================
 function connectWS() {
-  if (state.ws) { try { state.ws.close(); } catch(_) {} }
+  clearTimeout(state.reconnectTimer);
+  if (state.ws) { state.ws.onclose = null; try { state.ws.close(); } catch(_) {} }
   if (!state.token) return;
   const url = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws?token=${encodeURIComponent(state.token)}`;
-  state.ws = new WebSocket(url);
-  state.ws.onopen = () => setServiceState('online', '实时连接', 'WebSocket 已连接');
-  state.ws.onmessage = e => { try { handleWS(JSON.parse(e.data)); } catch(_) {} };
-  state.ws.onclose = () => {
+  const socket = new WebSocket(url);
+  state.ws = socket;
+  socket.onopen = () => { if (state.ws === socket) setServiceState('online', '实时连接', 'WebSocket 已连接'); };
+  socket.onmessage = e => { if (state.ws !== socket) return; try { handleWS(JSON.parse(e.data)); } catch(_) {} };
+  socket.onclose = () => {
+    if (state.ws !== socket || !state.token) return;
     setServiceState('syncing', '轮询模式', '实时通道断开，5 秒后重连');
     state.reconnectTimer = setTimeout(connectWS, 5000);
   };
-  state.ws.onerror = () => state.ws.close();
+  socket.onerror = () => socket.close();
 }
 
 function handleWS(msg) {
@@ -154,16 +173,16 @@ function handleWS(msg) {
   else if (msg.type === 'stats_update') {
     if (msg.data.stats) Object.assign(state.stats, msg.data.stats);
     if (msg.data.qqStats) Object.assign(state.qqStats, msg.data.qqStats);
-    if (msg.data.backends) { state.backends = msg.data.backends; renderBackendTable(); updateBackendStatus(); }
-    renderStats(); updateChart(); updateQqChart(); qqStatsDisplay();
+    if (msg.data.backends) state.backends = msg.data.backends;
+    scheduleLiveRender('stats');
   }
-  else if (msg.type === 'new_log') { state.logs.unshift(msg.log); if (state.logs.length>200) state.logs.pop(); renderLogs(true); }
+  else if (msg.type === 'new_log') { state.logs.unshift(msg.log); if (state.logs.length>200) state.logs.pop(); scheduleLiveRender('logs'); }
   else if (msg.type === 'update_log' && msg.log) {
     const index = state.logs.findIndex(log => log.id === msg.log.id);
     if (index >= 0) state.logs[index] = { ...state.logs[index], ...msg.log };
     else state.logs.unshift(msg.log);
     if (state.logs.length > 200) state.logs.pop();
-    renderLogs(false);
+    scheduleLiveRender('logs');
   }
   else if (msg.type === 'groups_updated') { if (msg.groups) { state.groups = msg.groups; renderGroups(); renderGroupSelector(); } }
   else if (msg.type === 'rules_updated') { if (msg.rules) { state.rules = msg.rules; renderRules(); } }
@@ -172,6 +191,30 @@ function handleWS(msg) {
   else if (msg.type === 'config_updated') { /* handled by settings */ }
   else fetchOverview();
 }
+
+// 合并高频消息；隐藏标签页只更新数据，不反复重建 DOM/图表。
+const liveDirty = new Set();
+let liveRenderTimer = null;
+function scheduleLiveRender(kind) {
+  liveDirty.add(kind);
+  if (document.hidden || liveRenderTimer !== null) return;
+  liveRenderTimer = setTimeout(() => {
+    liveRenderTimer = null;
+    if (document.hidden) return;
+    if (liveDirty.delete('stats')) {
+      renderStats(); qqStatsDisplay(); renderBackendTable(); renderAgentTable();
+      updateChart(); updateQqChart();
+    }
+    if (liveDirty.delete('logs')) renderLogs(false);
+  }, 250);
+}
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) scheduleLiveRender('stats');
+});
+
+// 真正调整文档顺序，使键盘焦点顺序与视觉顺序一致。
+$('qqChartSection').before($('trafficSection'));
+$('algorithmSection').before($('backendSection'));
 
 // ==================== 数据获取 ====================
 async function fetchOverview() {
@@ -286,7 +329,7 @@ async function switchAlgorithm(algo) {
 // ==================== 图表 ====================
 function initChart() {
   if (!dom.chartCanvas || typeof Chart === 'undefined') return;
-  if (state.chart) { state.chart.destroy(); }
+  if (state.chart) { updateChart(); return; }
   const labels = Array.from({length:60}, (_,i)=>`${i}s`);
   const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
   const gridColor = isDark ? 'rgba(255,255,255,.06)' : 'rgba(0,0,0,.04)';
@@ -335,7 +378,7 @@ function qqStatsDisplay() {
 
 function initQqChart() {
   if (!dom.qqChartCanvas || typeof Chart === 'undefined') return;
-  if (state.qqChart) { state.qqChart.destroy(); }
+  if (state.qqChart) { updateQqChart(); return; }
   const labels = Array.from({length:60}, (_,i)=>`${i}s`);
   const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
   const gridColor = isDark ? 'rgba(255,255,255,.06)' : 'rgba(0,0,0,.04)';
@@ -366,6 +409,78 @@ function updateQqChart() {
 }
 
 // ==================== 后端节点管理 ====================
+const weightEdits = new Map();
+let newBackendGroups = ['default'];
+let editingBackendGroupsId = null;
+
+function getBackendGroups(backend) {
+  const values = Array.isArray(backend?.groups) ? backend.groups : [backend?.group || 'default'];
+  return [...new Set(values.filter(name => state.groups?.[name]))].length
+    ? [...new Set(values.filter(name => state.groups?.[name]))]
+    : ['default'];
+}
+
+function groupPickerMarkup(backend) {
+  const selected = getBackendGroups(backend);
+  const shown = selected.slice(0, 2).map(name => `<span class="group-chip">${esc(name)}</span>`).join('');
+  const more = selected.length > 2 ? `<span class="group-more">+${selected.length - 2}</span>` : '';
+  return `<button type="button" class="group-picker-cell" onclick="openBackendGroups('${backend.id}')" title="${esc(selected.join('、'))}" aria-label="编辑节点分组：${esc(selected.join('、'))}">${shown}${more}<span aria-hidden="true">▾</span></button>`;
+}
+
+function updateNewBackendGroupText() {
+  if (dom.newBackendGroupText) dom.newBackendGroupText.textContent = newBackendGroups.join('、');
+}
+
+function openBackendGroups(id = null) {
+  editingBackendGroupsId = id;
+  const backend = id ? state.backends.find(item => item.id === id) : null;
+  const selected = new Set(backend ? getBackendGroups(backend) : newBackendGroups);
+  dom.backendGroupsModalTitle.textContent = backend ? `选择分组 · ${backend.tag || backend.url || '节点'}` : '新节点所属分组';
+  dom.backendGroupOptions.innerHTML = Object.keys(state.groups || {}).map(name => `
+    <label class="group-picker-option">
+      <input type="checkbox" value="${esc(name)}" ${selected.has(name) ? 'checked' : ''}>
+      <span>${esc(name)}</span>
+    </label>`).join('');
+  dom.backendGroupsModal.classList.add('show');
+  dom.backendGroupOptions.querySelector('input')?.focus();
+}
+
+function closeBackendGroupsModal() {
+  dom.backendGroupsModal.classList.remove('show');
+  editingBackendGroupsId = null;
+}
+
+dom.newBackendGroup?.addEventListener('click', () => openBackendGroups(null));
+dom.backendGroupsModalClose?.addEventListener('click', closeBackendGroupsModal);
+dom.backendGroupsModalCancel?.addEventListener('click', closeBackendGroupsModal);
+dom.backendGroupsModalSave?.addEventListener('click', saveBackendGroupsSelection);
+dom.backendGroupsModal?.addEventListener('click', event => {
+  if (event.target === dom.backendGroupsModal) closeBackendGroupsModal();
+});
+
+async function saveBackendGroupsSelection() {
+  const selected = Array.from(dom.backendGroupOptions.querySelectorAll('input:checked'), input => input.value);
+  if (!selected.length) return toast('请至少选择一个分组', 'warning');
+  if (!editingBackendGroupsId) {
+    newBackendGroups = selected;
+    updateNewBackendGroupText();
+    closeBackendGroupsModal();
+    return;
+  }
+  const id = editingBackendGroupsId;
+  try {
+    const result = await (await api(`/api/backends/${encodeURIComponent(id)}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ groups: selected })
+    })).json();
+    if (result.ret !== 0) throw new Error(result.error || '保存失败');
+    const backend = state.backends.find(item => item.id === id);
+    if (backend) { backend.groups = selected; backend.group = selected[0]; }
+    closeBackendGroupsModal();
+    renderBackendTable(); renderAgentTable(); renderGroups();
+    toast(`节点已加入 ${selected.length} 个分组`, 'success');
+  } catch (error) { toast(error.message || '分组保存失败', 'error'); }
+}
+
 function renderBackendTable() {
   const backends = state.backends || [];
   const query = String(state.backendQuery || '').trim().toLowerCase();
@@ -375,7 +490,7 @@ function renderBackendTable() {
     if (filter === 'online' && !online) return false;
     if (filter === 'offline' && online) return false;
     if (!query) return true;
-    return [b.url, b.tag, b.group, b.remoteAddress, b.type].some(v => String(v || '').toLowerCase().includes(query));
+    return [b.url, b.tag, getBackendGroups(b).join(' '), b.remoteAddress, b.type].some(v => String(v || '').toLowerCase().includes(query));
   });
   const onlineCount = backends.filter(b => !b.disabled && (b.alive || b.disable_health_check)).length;
   if (dom.backendCountAll) dom.backendCountAll.textContent = backends.length;
@@ -387,27 +502,53 @@ function renderBackendTable() {
     const emptyText = dom.backendEmpty.querySelector('.empty-text');
     if (emptyText) emptyText.textContent = backends.length ? '没有符合当前筛选条件的节点' : '暂无后端节点，请点击上方「添加节点」';
   }
-  dom.backendTableBody.innerHTML = filtered.map(b => {
+  const markup = filtered.map(b => {
     const isTunnel = b.type === 'tunnel';
     const isFrp = b.type === 'frp';
-    const groupOpts = Object.keys(state.groups||{}).map(g => `<option value="${g}" ${(b.group||'default')===g?'selected':''}>${g}</option>`).join('');
     const statusLabel = b.disabled ? '已禁用' : (b.alive ? '在线' : (b.disable_health_check ? '在线(免检)' : '离线'));
     const online = b.disabled ? 'offline' : (b.alive ? 'online' : 'offline');
     const typeBadge = isTunnel ? '<span class="type-badge tunnel">Agent</span>' : (isFrp ? '<span class="type-badge frp">FRP</span>' : '<span class="type-badge http">HTTP</span>');
     const addr = isTunnel ? `<span style="font-size:12px;color:var(--text-secondary)">${esc(b.tag)}</span>` : (isFrp ? `<code style="font-size:12px">frp:${esc(b.tag)}</code>` : `<code style="font-size:12px">${esc(b.url)}</code>`);
+    const queryToJsonControl = `<button class="btn-icon query-json-toggle ${b.query_to_json_enabled ? 'active' : ''}" onclick="toggleQueryToJson('${b.id}',${!!b.query_to_json_enabled})" title="${b.query_to_json_enabled ? 'Query 转 JSON 已启用，点击关闭' : '将带 Query 的请求转为 POST JSON'}">Q→JSON</button>`;
+    const postToGetControl = `<button class="btn-icon request-method-toggle ${b.post_to_get_enabled ? 'active' : ''}" onclick="togglePostToGet('${b.id}',${!!b.post_to_get_enabled})" title="${b.post_to_get_enabled ? 'POST 转 GET 已启用，点击关闭' : '将 POST 的 JSON 或表单参数转为 GET Query'}">P→GET</button>`;
     return `<tr data-backend-id="${esc(b.id)}" ${b.disabled?'style="opacity:0.5"':''}>
       <td><span class="status-badge ${online}"><span class="status-dot ${online}"></span>${statusLabel}</span></td>
       <td>${typeBadge}</td>
       <td>${addr}</td>
-      <td><select class="form-input" style="width:auto;padding:2px 4px;font-size:11px" onchange="changeBackendGroup('${b.id}',this.value)">${groupOpts}</select></td>
-      <td><strong>${b.weight||1}</strong></td>
+      <td>${groupPickerMarkup(b)}</td>
+      <td><input class="form-input backend-weight-input" type="text" value="${b.weight||1}" inputmode="numeric" pattern="[0-9]*" maxlength="5" aria-label="${esc(b.tag||b.url||'节点')} 的权重" title="输入 1–10000，按完成或移开焦点保存；Escape 取消" oninput="weightEdits.set('${b.id}',this.value);this.removeAttribute('aria-invalid')" onblur="changeBackendWeight('${b.id}',this.value,this)" onkeydown="if(event.key==='Enter')this.blur();if(event.key==='Escape'){weightEdits.delete('${b.id}');this.value=state.backends.find(b=>b.id==='${b.id}')?.weight||1;this.blur()}"></td>
       <td><span class="tag-display" onclick="openTagModal('${b.id}')"><span class="tag-text">${esc(b.tag||'添加标签')}</span><span class="tag-edit-icon">✏️</span></span></td>
       <td>${b.connections||0}</td>
       <td>${b.responseTime?b.responseTime+'ms':'-'}</td>
       <td>${(b.totalRequests||0).toLocaleString()}</td>
-      <td><div style="display:flex;gap:4px;flex-wrap:wrap"><button class="btn-icon" onclick="toggleDisabled('${b.id}', ${b.disabled})" title="${b.disabled?'已禁用，点击启用':'启用此节点'}">${b.disabled?'▶️':'⏸️'}</button>${!b.alive && !b.disabled ? `<button class="btn-icon" onclick="reviveBackend('${b.id}')" title="标记为在线">✅</button>` : ''}<button class="btn-icon" onclick="toggleHealthCheck('${b.id}', ${b.disable_health_check})" title="${b.disable_health_check?'已禁用健康检查，点击启用':'健康检查已启用，点击禁用'}">${b.disable_health_check?'🚫':'💚'}</button><button class="btn-icon" onclick="openTagModal('${b.id}')" title="编辑标签">🏷️</button><button class="btn-icon" onclick="deleteBackend('${b.id}')" title="删除">🗑️</button></div></td>
+      <td><div style="display:flex;gap:4px;flex-wrap:wrap"><button class="btn-icon" onclick="toggleDisabled('${b.id}', ${b.disabled})" title="${b.disabled?'已禁用，点击启用':'启用此节点'}">${b.disabled?'▶️':'⏸️'}</button>${!b.alive && !b.disabled ? `<button class="btn-icon" onclick="reviveBackend('${b.id}')" title="标记为在线">✅</button>` : ''}<button class="btn-icon" onclick="toggleHealthCheck('${b.id}', ${b.disable_health_check})" title="${b.disable_health_check?'已禁用健康检查，点击启用':'健康检查已启用，点击禁用'}">${b.disable_health_check?'🚫':'💚'}</button>${queryToJsonControl}${postToGetControl}<button class="btn-icon" onclick="openTagModal('${b.id}')" title="编辑标签">🏷️</button><button class="btn-icon" onclick="deleteBackend('${b.id}')" title="删除">🗑️</button></div></td>
     </tr>`;
   }).join('');
+  // 按节点 ID 更新单元格，保留焦点、选择范围、移动端键盘和待保存草稿。
+  const template = document.createElement('template');
+  template.innerHTML = `<table><tbody>${markup}</tbody></table>`;
+  const existing = new Map(Array.from(dom.backendTableBody.children, row => [row.dataset.backendId, row]));
+  const visible = new Set();
+  for (const fresh of template.content.querySelector('tbody').children) {
+    const id = fresh.dataset.backendId;
+    visible.add(id);
+    const row = existing.get(id);
+    if (!row) {
+      const added = fresh.cloneNode(true);
+      if (weightEdits.has(id)) added.querySelector('.backend-weight-input').value = weightEdits.get(id);
+      dom.backendTableBody.appendChild(added);
+      continue;
+    }
+    row.style.cssText = fresh.style.cssText;
+    Array.from(fresh.children).forEach((cell, index) => {
+      const current = row.children[index];
+      if (current.contains(document.activeElement)) return;
+      if (index === 4 && weightEdits.has(id)) return;
+      if (current.innerHTML !== cell.innerHTML) current.innerHTML = cell.innerHTML;
+    });
+  }
+  for (const [id, row] of existing) if (!visible.has(id)) row.remove();
+  for (const id of weightEdits.keys()) if (!backends.some(b => b.id === id)) weightEdits.delete(id);
 }
 
 function setBackendFilter(filter) {
@@ -481,15 +622,52 @@ async function toggleDisabled(id, currentDisabled) {
   fetchOverview();
 }
 
+async function toggleQueryToJson(id, enabled) {
+  const r = await (await api(`/api/backends/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query_to_json_enabled: !enabled }) })).json();
+  if (r.ret === 0) {
+    fetchOverview();
+    toast(!enabled ? '此节点已启用 Query → POST JSON' : '此节点已恢复原始 Query 转发', 'success');
+  } else {
+    toast(r.error || '设置失败', 'error');
+  }
+}
+
+async function togglePostToGet(id, enabled) {
+  const r = await (await api(`/api/backends/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ post_to_get_enabled: !enabled }) })).json();
+  if (r.ret === 0) {
+    fetchOverview();
+    toast(!enabled ? '此节点已启用 POST → GET（已关闭 Q→JSON）' : '此节点已恢复原始 POST 转发', 'success');
+  } else {
+    toast(r.error || '设置失败', 'error');
+  }
+}
+
 async function deleteBackend(id) {
   if (!confirm('确定删除？')) return;
   const r = await (await api(`/api/backends/${id}`,{method:'DELETE'})).json();
   if (r.ret === 0) { fetchOverview(); toast('节点已删除', 'success'); }
 }
 
-async function changeBackendGroup(id, group) {
-  const r = await (await api(`/api/backends/${id}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({group})})).json();
-  if (r.ret === 0) fetchOverview();
+async function changeBackendWeight(id, weight, input) {
+  if (!weightEdits.has(id)) return;
+  if (!/^\d+$/.test(weight) || Number(weight) < 1 || Number(weight) > 10000) {
+    input?.setAttribute('aria-invalid', 'true');
+    toast('权重请输入 1–10000 的整数，尚未保存', 'warning');
+    return;
+  }
+  const value = Number(weight);
+  try {
+    const r = await (await api(`/api/backends/${encodeURIComponent(id)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ weight: value }) })).json();
+    if (r.ret !== 0) throw new Error(r.error || '权重更新失败');
+    const backend = state.backends.find(b => b.id === id);
+    if (backend) backend.weight = value;
+    if (weightEdits.get(id) === weight) weightEdits.delete(id);
+    toast('节点权重已更新为 ' + value, 'success');
+    renderBackendTable();
+  } catch (error) {
+    input?.setAttribute('aria-invalid', 'true');
+    toast(error.message || '保存失败，请重试；输入已保留', 'error');
+  }
 }
 
 function updateBackendStatus() {
@@ -517,19 +695,20 @@ function updateBackendStatus() {
 dom.showAddBackendBtn.addEventListener('click', ()=>{
   dom.addBackendForm.style.display='block';
   dom.newBackendUrl.focus();
-  updateGroupDropdown(dom.newBackendGroup);
+  newBackendGroups = ['default']; updateNewBackendGroupText();
 });
 dom.cancelAddBackendBtn.addEventListener('click', ()=>{
   dom.addBackendForm.style.display='none';
   dom.newBackendUrl.value=''; dom.newBackendWeight.value='1'; dom.newBackendTag.value='';
+  newBackendGroups = ['default']; updateNewBackendGroupText();
 });
 dom.addBackendBtn.addEventListener('click', async ()=>{
   const url = dom.newBackendUrl.value.trim();
   if (!url) return toast('请输入后端地址', 'warning');
   if (!url.startsWith('http://')&&!url.startsWith('https://')) return toast('地址须以 http:// 开头', 'warning');
   const r = await (await api('/api/backends',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({url,weight:parseInt(dom.newBackendWeight.value)||1,tag:dom.newBackendTag.value.trim(),group:dom.newBackendGroup.value})})).json();
-  if (r.ret===0){ dom.addBackendForm.style.display='none'; dom.newBackendUrl.value=''; dom.newBackendWeight.value='1'; dom.newBackendTag.value=''; fetchOverview(); toast('节点已添加', 'success'); }
+    body:JSON.stringify({url,weight:parseInt(dom.newBackendWeight.value)||1,tag:dom.newBackendTag.value.trim(),groups:newBackendGroups})})).json();
+  if (r.ret===0){ dom.addBackendForm.style.display='none'; dom.newBackendUrl.value=''; dom.newBackendWeight.value='1'; dom.newBackendTag.value=''; newBackendGroups=['default']; updateNewBackendGroupText(); fetchOverview(); toast('节点已添加', 'success'); }
   else toast(r.error||'添加失败', 'error');
 });
 
@@ -538,7 +717,7 @@ function renderGroups() {
   const gs = state.groups || {};
   const algos = state.algorithms || {};
   dom.groupsList.innerHTML = Object.entries(gs).map(([name, g]) => {
-    const bc = (state.backends||[]).filter(b=>(b.group||'default')===name).length;
+    const bc = (state.backends||[]).filter(b=>getBackendGroups(b).includes(name)).length;
     const algoName = algos[g.algorithm]?.name || g.algorithm;
     return `<div class="group-card">
       <div class="group-card-info">
@@ -587,7 +766,7 @@ dom.addGroupBtn.addEventListener('click', async ()=>{
 function renderRules() {
   const rules = state.rules || [];
   dom.rulesList.innerHTML = rules.length ? rules.map(r => {
-    const matchTypeLabel = r.matchType === 'query' ? '查询参数' : r.matchType === 'json' ? 'JSON字段' : '前缀匹配';
+    const matchTypeLabel = ({ query: '查询参数', json: 'JSON字段', keyword: '关键词', header: '请求头', method: '请求方法' })[r.matchType] || '前缀匹配';
     return `<div class="rule-item">
       <div class="rule-item-left">
         <span class="rule-path">${esc(r.path)}</span>
@@ -621,7 +800,7 @@ async function editRule(id) {
   dom.addRuleBtn.textContent = '更新';
   dom.addRuleBtn.onclick = async () => {
     const path = dom.newRulePath.value.trim();
-    if (!path) return toast('请输入路径前缀', 'warning');
+    if (!path) return toast('请输入匹配表达式', 'warning');
     const matchType = dom.newRuleMatchType.value;
     if (matchType === 'query' && !path.includes('?')) return toast('查询参数匹配的路径须包含 ?，例如 /sign?ver=xxx', 'warning');
   if (matchType === 'json' && !path.includes(':')) return toast('JSON字段匹配格式为 /path:key=value，例如 /sign:ver=xxx', 'warning');
@@ -648,7 +827,7 @@ function resetRuleForm() {
 
 async function defaultAddRuleHandler() {
   const path = dom.newRulePath.value.trim();
-  if (!path) return toast('请输入路径前缀', 'warning');
+  if (!path) return toast('请输入匹配表达式', 'warning');
   const matchType = dom.newRuleMatchType.value;
   if (matchType === 'query' && !path.includes('?')) return toast('查询参数匹配的路径须包含 ?，例如 /sign?ver=xxx', 'warning');
   if (matchType === 'json' && !path.includes(':')) return toast('JSON字段匹配格式为 /path:key=value，例如 /sign:ver=xxx', 'warning');
@@ -673,8 +852,15 @@ dom.cancelAddRuleBtn.addEventListener('click', resetRuleForm);
 // ==================== 系统设置（自动保存失焦） ====================
 let settingsAutoSaveDone = false;
 function renderSettings() {
+  const fields = ['setAgentToken','setHcInterval','setHcTimeout','setTunnelTimeout','setRequestTimeout','setMaxLog','setFrpPort','setPersistStats','setVersionRewrite','setVersionTarget','setAutoBackup','setBackupInterval','setRetry400','setRetry400Max','setRetry502','setRetry502Max'];
+  const before = new Map(fields.map(id => [id, dom[id]?.value]));
   api('/api/config').then(r=>r.json()).then(d=>{
     if (d.ret===0) {
+      // 响应到达前用户可能开始编辑；保留聚焦、已改动和未保存的输入。
+      const protectedInputs = fields.map(id => dom[id]).filter(el => el &&
+        (el === document.activeElement || el.value !== before.get(el.id) ||
+          (el._sv !== undefined && String(el.value) !== String(el._sv))))
+        .map(el => ({ el, value: el.value, checked: el.checked, saved: el._sv }));
       dom.setAgentToken.value = d.data.agent_token||'';
       dom.setHcInterval.value = d.data.hc_interval||5000;
       dom.setHcTimeout.value = d.data.hc_timeout||3000;
@@ -693,8 +879,13 @@ function renderSettings() {
       dom.setMaxBackupsLabel.textContent = d.data.max_backups || 30;
       dom.setRetry400.checked = d.data.retry_400_enabled !== false;
       dom.setRetry400Max.value = d.data.retry_400_max || 2;
+      dom.setRetry502.checked = d.data.retry_502_enabled !== false;
+      dom.setRetry502Max.value = d.data.retry_502_max || 2;
+      for (const item of protectedInputs) {
+        item.el.value = item.value; item.el.checked = item.checked; item.el._sv = item.saved;
+      }
     }
-  });
+  }).catch(() => { /* 保留当前表单，等待下次同步。 */ });
   if (settingsAutoSaveDone) return;
   settingsAutoSaveDone = true;
   autoSaveSetting(dom.setAgentToken, 'agent_token', v => v.trim());
@@ -708,14 +899,14 @@ function renderSettings() {
   dom.setAdminPassword.addEventListener('change', () => {
     const v = dom.setAdminPassword.value.trim();
     if (!v) return;
-    if (v.length < 4) { toast('密码至少 4 位', 'error'); dom.setAdminPassword.value = ''; return; }
+    if (v.length < 8) { toast('密码至少 8 位', 'error'); return; }
     api('/api/config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ admin_password: v }) })
       .then(r => r.json()).then(d => {
         if (d.ret === 0) { toast('密码已更新，请重新登录', 'success'); dom.setAdminPassword.value = ''; setTimeout(() => location.reload(), 1500); }
         else toast('失败: ' + d.error, 'error');
       });
   });
-  dom.saveSettingsBtn.style.display = 'none';
+  if (dom.saveSettingsBtn) dom.saveSettingsBtn.style.display = 'none';
   // persist_stats 开关 — 即时保存
   dom.setPersistStats.addEventListener('change', () => {
     api('/api/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({persist_stats:dom.setPersistStats.checked})})
@@ -755,14 +946,27 @@ function renderSettings() {
     api('/api/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({retry_400_max:v})})
       .then(r=>r.json()).then(d=>{if(d.ret===0)toast('同节点重试次数已设为 '+v,'info')});
   });
+  // 431/429/502/504/连接失败 自动重试开关
+  dom.setRetry502.addEventListener('change', () => {
+    api('/api/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({retry_502_enabled:dom.setRetry502.checked})})
+      .then(r=>r.json()).then(d=>{if(d.ret===0)toast(d.data.retry_502_enabled?'431/429/502/504/连接失败 自动重试已启用':'431/429/502/504/连接失败 自动重试已关闭','info')});
+  });
+  // 最大重试次数（即时保存）
+  dom.setRetry502Max.addEventListener('change', () => {
+    const v = Math.max(1, Math.min(5, parseInt(dom.setRetry502Max.value) || 2));
+    dom.setRetry502Max.value = v;
+    api('/api/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({retry_502_max:v})})
+      .then(r=>r.json()).then(d=>{if(d.ret===0)toast('同节点重试次数已设为 '+v,'info')});
+  });
 }
 
 function autoSaveSetting(el, key, transform) {
   el.addEventListener('blur', () => {
     const v = transform(el.value);
-    if (v === el._sv) return;
+    if (String(v) === String(el._sv)) return;
     api('/api/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({[key]:v})})
-      .then(r=>r.json()).then(d=>{if(d.ret===0){el._sv=v;flashStatus('✅ 已自动保存')}});
+      .then(r=>r.json()).then(d=>{if(d.ret===0){el._sv=v;flashStatus('✅ 已自动保存')}else toast(d.error || '设置保存失败', 'error')})
+      .catch(() => toast('设置保存失败，输入已保留', 'error'));
   });
 }
 
@@ -775,6 +979,8 @@ function flashStatus(text) {
 // ==================== 日志 ====================
 function renderLogs(isNew) {
   const logs = state.logs || [];
+  const retainedIds = new Set(logs.map(log => log.id));
+  for (const id of state.expandedLogIds) if (!retainedIds.has(id)) state.expandedLogIds.delete(id);
   dom.logEmpty.style.display = logs.length ? 'none' : 'block';
   dom.logCount.textContent = `${logs.length}`;
   dom.logTableBody.innerHTML = logs.slice(0,50).map((log,i) => {
@@ -782,20 +988,31 @@ function renderLogs(isNew) {
     const isConnect = log.algorithm === 'connect';
     const isDisconnect = log.algorithm === 'disconnect';
     const m = isAgent ? 'agent' : (log.method||'GET').toLowerCase();
+    const forwardedMethod = log.forwardMethod && log.forwardMethod !== log.method ? `<span class="method-forward">→ ${esc(log.forwardMethod)}</span>` : '';
+    const isExpanded = state.expandedLogIds.has(log.id);
+    const fullPath = log.fullPath || log.path || '-';
+    const shownPath = isExpanded ? fullPath : (log.path || '-');
+    const pathToggle = fullPath !== log.path ? `<button class="log-path-toggle" onclick="toggleLogPath('${esc(log.id)}')">${isExpanded ? '收起' : '展开'}</button>` : '';
     const sc = isConnect ? 'success' : isDisconnect ? 'error' : (log.statusCode>=200&&log.statusCode<300?'success':log.statusCode>=400?'error':'');
     const algoLabel = isConnect ? '上线' : isDisconnect ? '断开' : esc(log.algorithm||'-');
     const statusLabel = isConnect ? 'ON' : isDisconnect ? 'OFF' : (log.statusCode||(log.success?'200':'502'));
     return `<tr class="${i===0&&isNew?'log-row-new':''}">
-      <td style="white-space:nowrap;font-size:11px;color:var(--text-secondary)">${esc(log.time)}</td>
-      <td>${isAgent ? '<span class="method-badge agent">AGENT</span>' : `<span class="method-badge ${m}">${esc(log.method)}</span>`}</td>
-      <td style="max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(log.path)}">${esc(log.path)}</td>
-      <td style="font-size:11px;color:var(--text-secondary)">${esc(log.group||'-')}</td>
-      <td style="font-size:11px;max-width:120px;overflow:hidden;text-overflow:ellipsis">${esc(log.backend)}</td>
-      <td style="font-size:11px">${algoLabel}</td>
-      <td><span class="status-code ${sc}">${statusLabel}</span></td>
-      <td style="font-size:11px;color:var(--text-secondary)">${log.responseTime?log.responseTime+'ms':'-'}</td>
+      <td class="log-time" data-label="时间">${esc(log.time)}</td>
+      <td class="log-method" data-label="方法">${isAgent ? '<span class="method-badge agent">AGENT</span>' : `<span class="method-badge ${m}">${esc(log.method)}</span>${forwardedMethod}`}</td>
+      <td class="log-path" data-label="请求路径" title="${esc(fullPath)}"><span class="log-path-text">${esc(shownPath)}</span>${pathToggle}</td>
+      <td class="log-group" data-label="分组">${esc(log.group||'-')}</td>
+      <td class="log-backend" data-label="目标节点">${esc(log.backend)}</td>
+      <td class="log-algorithm" data-label="调度">${algoLabel}</td>
+      <td class="log-status" data-label="状态"><span class="status-code ${sc}">${statusLabel}</span></td>
+      <td class="log-duration" data-label="耗时">${log.responseTime?log.responseTime+'ms':'-'}</td>
     </tr>`;
   }).join('');
+}
+
+function toggleLogPath(id) {
+  if (state.expandedLogIds.has(id)) state.expandedLogIds.delete(id);
+  else state.expandedLogIds.add(id);
+  renderLogs(false);
 }
 
 // ==================== 标签编辑弹窗 ====================
@@ -830,21 +1047,29 @@ function updateAlgoDropdown(sel) {
 }
 
 // ==================== frpc Agent 配置面板 ====================
+let frpcEventsBound = false;
 function renderFrpcConfig() {
   const host = location.hostname;
   const port = location.port || '8888';
-  dom.cfgServerAddr.value = host;
-  dom.cfgServerPort.value = port;
+  if (!frpcEventsBound) {
+    dom.cfgServerAddr.value = host;
+    dom.cfgServerPort.value = port;
+  }
 
   api('/api/config').then(r => r.json()).then(d => {
     if (d.ret === 0) {
-      if (d.data.agent_token) dom.cfgAgentToken.value = d.data.agent_token;
-      dom.cfgAgentToken._savedVal = d.data.agent_token || '';
-      dom.cfgFrpPort.value = d.data.frp_port || 7000;
+      if (document.activeElement !== dom.cfgAgentToken && (!frpcEventsBound || dom.cfgAgentToken.value === (dom.cfgAgentToken._savedVal || ''))) {
+        dom.cfgAgentToken.value = d.data.agent_token || '';
+        dom.cfgAgentToken._savedVal = d.data.agent_token || '';
+      }
+      if (document.activeElement !== dom.cfgFrpPort) dom.cfgFrpPort.value = d.data.frp_port || 7000;
+      updateAgentCmd();
     }
   }).catch(() => {});
 
   updateAgentCmd();
+  if (frpcEventsBound) return;
+  frpcEventsBound = true;
   dom.cfgAgentToken.addEventListener('input', updateAgentCmd);
   dom.cfgAgentToken.addEventListener('blur', () => {
     const v = dom.cfgAgentToken.value.trim();
@@ -950,6 +1175,7 @@ dom.addProxyBtn.addEventListener('click', async () => {
 // ─── Agent 连接表 ────────────────────────────────────
 function renderAgentTable() {
   const agents = (state.backends || []).filter(b => b.type === 'tunnel');
+  if (dom.agentTableBody.contains(document.activeElement) || agents.some(b => weightEdits.has(b.id))) return;
   dom.agentEmpty.style.display = agents.length ? 'none' : 'block';
   dom.agentTableBody.innerHTML = agents.map(b => {
     const online = b.alive ? 'online' : 'offline';
@@ -958,23 +1184,14 @@ function renderAgentTable() {
       <td><span class="status-badge ${online}"><span class="status-dot ${online}"></span>${b.alive ? '已连接' : '离线'}</span></td>
       <td><code style="font-size:12px">${esc(b.tag)}</code></td>
       <td style="font-size:11px;color:var(--text-secondary)">${esc(b.remoteAddress||'unknown')}</td>
-      <td>
-        <select class="form-input" style="width:auto;padding:2px 4px;font-size:11px" onchange="changeAgentGroup('${b.id}', this.value)">
-          ${Object.keys(state.groups||{}).map(g => `<option value="${g}" ${(b.group||'default')===g?'selected':''}>${g}</option>`).join('')}
-        </select>
-      </td>
-      <td><input type="number" value="${b.weight||1}" min="1" max="100" style="width:50px;padding:2px 4px;font-size:11px" onchange="changeAgentWeight('${b.id}', this.value)"></td>
+      <td>${groupPickerMarkup(b)}</td>
+      <td><input class="form-input backend-weight-input" type="text" value="${b.weight||1}" inputmode="numeric" maxlength="5" aria-label="${esc(b.tag||'Agent')} 的权重" oninput="weightEdits.set('${b.id}',this.value)" onblur="changeBackendWeight('${b.id}',this.value,this)" onkeydown="if(event.key==='Enter')this.blur()"></td>
       <td style="font-size:11px;color:var(--text-secondary)">${connTime}</td>
       <td style="font-size:11px">${(b.totalRequests||0).toLocaleString()}</td>
       <td style="font-size:11px;color:var(--text-secondary)">${b.responseTime?b.responseTime+'ms':'-'}</td>
       <td><button class="btn btn-danger btn-xs" onclick="deleteBackend('${b.id}')" title="断开">断开</button></td>
     </tr>`;
   }).join('');
-}
-
-async function changeAgentGroup(id, group) {
-  const r = await (await api(`/api/backends/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ group }) })).json();
-  if (r.ret === 0) fetchOverview();
 }
 
 async function changeAgentWeight(id, weight) {
@@ -1012,17 +1229,23 @@ document.addEventListener('DOMContentLoaded', ()=>{
         if (dom.lastUpdated) dom.lastUpdated.textContent = '刚刚更新';
         renderAll();
       }
-    }).catch(() => { showLogin(); });
+    }).catch(error => { console.warn('面板初始化失败', error); showLogin(); });
   } else {
     showLogin();
   }
 });
 
 function showLogin() {
+  document.documentElement.classList.remove('auth-pending');
+  state.token = null;
+  localStorage.removeItem('lb_token');
+  clearTimeout(state.reconnectTimer);
+  if (state.ws) { state.ws.onclose = null; state.ws.close(); state.ws = null; }
   dom.loginOverlay.style.display = 'flex';
   dom.logoutBtn.style.display = 'none';
 }
 function hideLogin() {
+  document.documentElement.classList.remove('auth-pending');
   dom.loginOverlay.style.display = 'none';
   dom.logoutBtn.style.display = '';
 }

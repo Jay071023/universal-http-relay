@@ -1,13 +1,17 @@
 node_modules/
 dist/
 logs/
+qq-stats/
 config.json
+debug-route.json
+node-bootstrap.json
 .deploy.env
 .env
 .package-lock.json
 *.old
 *.log
 *.pid
+deploy-token.txt
 backups/
 certs/
 memory/
@@ -18,6 +22,7 @@ health-monitor.js
 AGENTS.md
 CLAUDE.md
 启动*.bat
+!停止服务.bat
 PM2守护启动.bat
 setup-certs.bat
 push.bat

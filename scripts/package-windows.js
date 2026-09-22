@@ -25,6 +25,7 @@ const ZIP_PATH = path.join(DIST, `${NAME}.zip`);
 
 const TOP_LEVEL_FILES = [
   'lb-server.js', 'lb-server-real.js',
+  'windows-supervisor.js',
   'deploy-server.js', 'agent.js', 'upload.js', 'control.js',
   'test-backend.js', 'test-frps.js',
   'package.json', 'package-lock.json',
@@ -125,9 +126,12 @@ for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":%LB_PORT%" ^| findstr LISTE
 for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":%DEPLOY_PORT%" ^| findstr LISTENING') do taskkill /F /PID %%a >nul 2>&1
 timeout /t 2 /nobreak >nul
 
-echo [4/4] Starting services ...
-start "lb-server" /min node lb-server.js
-start "deploy-server" /min node deploy-server.js --port %DEPLOY_PORT%
+if not exist "logs\\" mkdir "logs"
+set "DEPLOY_SERVICE_MANAGER=pidfile"
+
+echo [4/4] Starting supervised services ...
+start "lb-server supervisor" /min node windows-supervisor.js --service lb-server
+start "deploy-server supervisor" /min node windows-supervisor.js --service deploy-server --port %DEPLOY_PORT%
 timeout /t 3 /nobreak >nul
 
 echo.
@@ -139,7 +143,7 @@ echo ============================================================
 echo.
 echo  On first run, the ADMIN_PASSWORD shown above is the login
 echo  password (also stored in config.json). No username needed.
-echo  Change it later in WebUI Settings, or stop with stop-service.bat
+echo  Change it later in WebUI Settings, or stop with the stop script
 echo.
 if defined FIRST_RUN (
   start "" http://localhost:%LB_PORT%/
@@ -164,17 +168,14 @@ title Stop Universal HTTP Relay
 cd /d "%~dp0"
 chcp 65001 >nul
 
-set "LB_PORT=8888"
-set "DEPLOY_PORT=7879"
-
-echo Stopping lb-server (PID file) ...
-if exist "lb-server.pid" (
-  for /f "delims=" %%p in (lb-server.pid) do taskkill /F /PID %%p >nul 2>&1
+echo Stopping project services by PID file ...
+for %%F in ("lb-server.supervisor.pid" "deploy-server.supervisor.pid") do (
+  if exist "%%~F" for /f "delims=" %%p in (%%~F) do taskkill /T /F /PID %%p >nul 2>&1
 )
-echo Stopping listeners on port %LB_PORT% / %DEPLOY_PORT% ...
-for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":%LB_PORT%" ^| findstr LISTENING') do taskkill /F /PID %%a >nul 2>&1
-for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":%DEPLOY_PORT%" ^| findstr LISTENING') do taskkill /F /PID %%a >nul 2>&1
-echo Done. (If a QQ/backend process still holds the port, check netstat.)
+if exist "lb-server.pid" (
+  for /f "delims=" %%p in (lb-server.pid) do taskkill /T /F /PID %%p >nul 2>&1
+)
+echo Done. Other applications using nearby ports were not touched.
 pause
 `;
 

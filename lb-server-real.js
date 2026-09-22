@@ -17,7 +17,12 @@ const msgpack = require('@msgpack/msgpack');
 process.on('uncaughtException', (err) => {
   console.error(`\n  ⚠️  [FATAL] 未捕获异常: ${err.message}`);
   console.error(`  ${err.stack}\n`);
-  // 不退出进程，记录日志继续运行
+  // 未捕获异常后继续运行可能留下半损坏的服务状态；交给 Windows
+  // supervisor/PM2 重启，避免 UI 看似在线但请求和 WebSocket 已失效。
+  if (!process.__fatalExitScheduled) {
+    process.__fatalExitScheduled = true;
+    setTimeout(() => process.exit(1), 100);
+  }
 });
 process.on('unhandledRejection', (reason) => {
   console.error(`\n  ⚠️  [WARN] 未处理的 Promise 拒绝: ${reason instanceof Error ? reason.message : reason}`);
@@ -154,6 +159,15 @@ function requireAdmin(req, res, next) {
 
 // ==================== 配置系统（持久化到 config.json） ====================
 const CONFIG_PATH = path.resolve(process.env.LB_CONFIG_PATH || path.join(__dirname, 'config.json'));
+// QQ 统计使用追加式文本存储，不再把几千个 QQ 号反复写回 config.json。
+const QQ_STATS_DIR = path.resolve(process.env.LB_QQ_STATS_DIR || path.join(path.dirname(CONFIG_PATH), 'qq-stats'));
+const QQ_ALL_PATH = path.join(QQ_STATS_DIR, 'all-qq.txt');
+const QQ_TOTAL_PATH = path.join(QQ_STATS_DIR, 'total.count');
+// 仅用于临时排障的独立路由配置；文件不存在或 enabled=false 时完全不生效。
+// 密钥仅保存在运行目录的 debug-route.json，不写入管理配置、日志或响应。
+const DEBUG_ROUTE_PATH = path.resolve(process.env.LB_DEBUG_ROUTE_PATH || path.join(__dirname, 'debug-route.json'));
+// 一次性节点引导配置：用于把已验证节点安全加入现有分组，不覆盖整个 config.json。
+const NODE_BOOTSTRAP_PATH = path.resolve(process.env.LB_NODE_BOOTSTRAP_PATH || path.join(__dirname, 'node-bootstrap.json'));
 const MAX_REQUEST_BODY_BYTES = Math.max(1024, parseInt(process.env.LB_MAX_REQUEST_BODY_BYTES, 10) || 10 * 1024 * 1024);
 
 const DEFAULT_CONFIG = {
@@ -179,11 +193,15 @@ const DEFAULT_CONFIG = {
   retry_400_enabled: true, // 后端返回 400 时自动重试
   retry_400_max: 2,        // 同一节点最大重试次数
   retry_400_max_backends: 3, // 换节点最多尝试几个
+  retry_502_enabled: true, // 后端返回 429/502/504 或连接/传输失败时自动重试
+  retry_502_max: 2,        // 同一节点最大重试次数
+  retry_502_max_backends: 3, // 换节点最多尝试几个
 };
 
 let CONFIG = { ...DEFAULT_CONFIG };
 let hcTimer = null;      // 健康检查定时器
 let statsTimer = null;   // 统计推送定时器
+let debugRoute = null;
 
 function loadConfig() {
   try {
@@ -205,13 +223,50 @@ function saveConfig() {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     const tempPath = `${CONFIG_PATH}.tmp-${process.pid}`;
     fs.writeFileSync(tempPath, JSON.stringify(CONFIG, null, 2), { encoding: 'utf8', mode: 0o640 });
-    if (process.platform === 'win32' && fs.existsSync(CONFIG_PATH)) fs.rmSync(CONFIG_PATH, { force: true });
     fs.renameSync(tempPath, CONFIG_PATH);
     return true;
   } catch (e) {
     console.error(`  ❌ 配置文件写入失败: ${e.message}`);
     return false;
   }
+}
+
+function loadDebugRoute() {
+  debugRoute = null;
+  try {
+    if (!fs.existsSync(DEBUG_ROUTE_PATH)) return;
+    const data = JSON.parse(fs.readFileSync(DEBUG_ROUTE_PATH, 'utf8'));
+    if (!data.enabled || typeof data.token !== 'string' || data.token.length < 32) return;
+    if (typeof data.url !== 'string' || !/^https?:\/\//i.test(data.url)) return;
+    debugRoute = {
+      token: data.token,
+      url: data.url,
+      tag: String(data.tag || 'debug-route').slice(0, 100),
+      query_to_json_enabled: !!data.query_to_json_enabled,
+      post_to_get_enabled: !!data.post_to_get_enabled
+    };
+    console.log(`  🧪 已启用仅调试路由 → ${debugRoute.tag}`);
+  } catch (e) {
+    console.error(`  ⚠️ 调试路由配置无效，已忽略: ${e.message}`);
+  }
+}
+
+/** 仅匹配持有运行期密钥的排障请求；请求头在转发前删除。 */
+function selectDebugRoute(req) {
+  if (!debugRoute) return null;
+  const provided = String(req.headers['x-lb-debug-route'] || '');
+  const expected = Buffer.from(debugRoute.token, 'utf8');
+  const actual = Buffer.from(provided, 'utf8');
+  if (expected.length !== actual.length || !crypto.timingSafeEqual(expected, actual)) return null;
+  delete req.headers['x-lb-debug-route'];
+  return {
+    id: `debug:${crypto.createHash('sha256').update(debugRoute.url).digest('hex').slice(0, 16)}`,
+    type: 'http', url: debugRoute.url, tag: debugRoute.tag, group: '__debug__',
+    alive: true, connections: 0, responseTime: 0, totalRequests: 0, successRequests: 0, failRequests: 0,
+    query_to_json_enabled: debugRoute.query_to_json_enabled,
+    post_to_get_enabled: debugRoute.post_to_get_enabled,
+    _debugRoute: true
+  };
 }
 
 function ensureAdminPassword() {
@@ -227,14 +282,16 @@ const CONFIG_MUTABLE_KEYS = [
   'admin_password', 'page_title', 'bark_key', 'monitor_interval', 'persist_stats',
   'version_rewrite_enabled', 'version_rewrite_target', 'auto_backup_enabled',
   'auto_backup_interval', 'max_backups', 'retry_400_enabled', 'retry_400_max',
-  'retry_400_max_backends', 'cors_origins'
+  'retry_400_max_backends', 'cors_origins',
+  'retry_502_enabled', 'retry_502_max', 'retry_502_max_backends'
 ];
 const CONFIG_CLIENT_KEYS = [
   'port', 'frp_port', 'agent_token', 'hc_interval', 'hc_timeout', 'tunnel_timeout',
   'request_timeout',
   'max_log', 'page_title', 'monitor_interval', 'persist_stats', 'version_rewrite_enabled',
   'version_rewrite_target', 'auto_backup_enabled', 'auto_backup_interval', 'max_backups',
-  'retry_400_enabled', 'retry_400_max', 'retry_400_max_backends', 'cors_origins'
+  'retry_400_enabled', 'retry_400_max', 'retry_400_max_backends', 'cors_origins',
+  'retry_502_enabled', 'retry_502_max', 'retry_502_max_backends'
 ];
 
 function getClientConfig() {
@@ -292,11 +349,36 @@ function updateSortedRules() {
   sortedRules = [...rules].sort((a, b) => (b.priority || 0) - (a.priority || 0));
 }
 
-/** 根据请求路径+查询参数匹配路由规则，返回分组名 */
-function matchGroup(url) {
+const RULE_MATCH_TYPES = new Set(['prefix', 'query', 'json', 'keyword', 'header', 'method']);
+
+function readJsonField(body, keyPath) {
+  let value = body;
+  for (const key of keyPath.split('.')) {
+    if (value == null || typeof value !== 'object') return undefined;
+    value = value[key];
+  }
+  return value;
+}
+
+function useMatchedRule(req, rule) {
+  req._lbMatchedRule = rule;
+  return rule.group;
+}
+
+/** 按优先级匹配路径、参数、JSON、关键词、请求头和方法，返回分组名。 */
+function matchGroup(req) {
+  const url = req.url || '/';
   const qIdx = url.indexOf('?');
   const pathOnly = qIdx >= 0 ? url.slice(0, qIdx) : url;
   const queryStr = qIdx >= 0 ? url.slice(qIdx + 1) : '';
+  let decodedUrl = url;
+  try { decodedUrl = decodeURIComponent(url); } catch (_) {}
+  let jsonText = '';
+  if (req.body && typeof req.body === 'object') {
+    try { jsonText = JSON.stringify(req.body).slice(0, 65536).toLowerCase(); } catch (_) {}
+  }
+  const headerText = Object.entries(req.headers || {})
+    .map(([key, value]) => `${key}:${Array.isArray(value) ? value.join(',') : value}`).join('\n').slice(0, 16384).toLowerCase();
 
   for (const rule of sortedRules) {
     if (rule.matchType === 'query') {
@@ -308,41 +390,35 @@ function matchGroup(url) {
       if (!pathOnly.startsWith(rulePath)) continue;
       const params = queryStr.split('&');
       const matched = params.some(p => p === ruleQuery || p.startsWith(ruleQuery + '='));
-      if (matched) return rule.group;
-    } else {
+      if (matched) return useMatchedRule(req, rule);
+    } else if (rule.matchType === 'json') {
+      // json 类型: /path:key.subkey=value
+      const colon = rule.path.indexOf(':');
+      if (colon === -1) continue;
+      const rulePath = rule.path.slice(0, colon);
+      const expr = rule.path.slice(colon + 1);
+      const eq = expr.indexOf('=');
+      if (eq === -1 || !pathOnly.startsWith(rulePath)) continue;
+      if (String(readJsonField(req.body, expr.slice(0, eq))) === expr.slice(eq + 1)) return useMatchedRule(req, rule);
+    } else if (rule.matchType === 'keyword') {
+      const keyword = rule.path.trim().toLowerCase();
+      if (keyword && (decodedUrl.toLowerCase().includes(keyword) || headerText.includes(keyword) || jsonText.includes(keyword))) return useMatchedRule(req, rule);
+    } else if (rule.matchType === 'header') {
+      const separator = rule.path.indexOf('=');
+      if (separator === -1) continue;
+      const name = rule.path.slice(0, separator).trim().toLowerCase();
+      const expected = rule.path.slice(separator + 1).trim().toLowerCase();
+      const actual = req.headers?.[name];
+      if (name && expected && String(Array.isArray(actual) ? actual.join(',') : actual || '').toLowerCase().includes(expected)) return useMatchedRule(req, rule);
+    } else if (rule.matchType === 'method') {
+      const methods = rule.path.split(',').map(value => value.trim().toUpperCase());
+      if (methods.includes(String(req.method || '').toUpperCase())) return useMatchedRule(req, rule);
+    } else if (url.startsWith(rule.path)) {
       // prefix 类型（默认）: 在完整 URL（含查询串）上做前缀匹配
-      if (url.startsWith(rule.path)) return rule.group;
+      return useMatchedRule(req, rule);
     }
   }
   return 'default';
-}
-
-/** 根据请求体 JSON 匹配路由规则（用于 json 类型的规则） */
-function matchGroupByBody(path, body) {
-  if (!body || typeof body !== 'object') return null;
-  for (const rule of sortedRules) {
-    if (rule.matchType !== 'json') continue;
-    // rule.path 格式为 /path:key=value，冒号前是路径，冒号后是 JSON 键路径和期望值
-    const colon = rule.path.indexOf(':');
-    if (colon === -1) continue;
-    const rulePath = rule.path.slice(0, colon);
-    const ruleExpr = rule.path.slice(colon + 1);
-    if (!path.startsWith(rulePath)) continue;
-    // ruleExpr 格式: key.subkey=value
-    const eq = ruleExpr.indexOf('=');
-    if (eq === -1) continue;
-    const keyPath = ruleExpr.slice(0, eq);
-    const expected = ruleExpr.slice(eq + 1);
-    // 按点号逐层取值
-    let val = body;
-    const keys = keyPath.split('.');
-    for (const k of keys) {
-      if (val == null || typeof val !== 'object') { val = undefined; break; }
-      val = val[k];
-    }
-    if (String(val) === expected) return rule.group;
-  }
-  return null;
 }
 
 /**
@@ -375,11 +451,40 @@ function getGroupAlgorithm(groupName) {
   return (groups[groupName] || groups['default']).algorithm;
 }
 
+/** 节点可同时属于多个分组；group 保留为主分组以兼容旧配置和旧客户端。 */
+function backendGroupNames(backend) {
+  const raw = Array.isArray(backend?.groups) ? backend.groups : [backend?.group || 'default'];
+  const names = [...new Set(raw.map(name => String(name || '').trim()).filter(name => name && groups[name]))];
+  return names.length ? names : ['default'];
+}
+
+function setBackendGroups(backend, names) {
+  const normalized = [...new Set((Array.isArray(names) ? names : [names]).map(name => String(name || '').trim()))]
+    .filter(name => name && groups[name]);
+  backend.groups = normalized.length ? normalized : ['default'];
+  backend.group = backend.groups[0];
+  return backend.groups;
+}
+
+function validateBackendGroups(value) {
+  if (!Array.isArray(value)) value = [value];
+  if (value.length < 1 || value.length > 100) return { error: '请至少选择 1 个分组' };
+  const names = [...new Set(value.map(name => String(name || '').trim()).filter(Boolean))];
+  if (!names.length) return { error: '请至少选择 1 个分组' };
+  const unknown = names.find(name => !groups[name]);
+  if (unknown) return { error: `分组不存在: ${unknown}` };
+  return { names };
+}
+
+function backendInGroup(backend, groupName) {
+  return backendGroupNames(backend).includes(groupName);
+}
+
 /** 获取分组内所有在线的后端 */
 function getAliveBackendsInGroup(groupName, excludeIds) {
   return Array.from(backends.values())
     .filter(b => b.alive && !b.disabled)
-    .filter(b => (b.group || 'default') === groupName)
+    .filter(b => backendInGroup(b, groupName))
     .filter(b => !excludeIds || !excludeIds.has(b.id));
 }
 
@@ -398,7 +503,67 @@ const backends = new Map();         // id → backend object（HTTP 或 Tunnel�
 let currentAlgorithm = 'round-robin';    // 默认算法（同时作为 default 分组的算法）
 const pendingRequests = new Map();  // requestId → { backendId, resolve, reject, timer }
 const requestLogs = [];
-const retryRequests = new Map();    // reqId → { sameRetriesLeft, backendsLeft, triedBackendIds }
+const retryRequests = new Map();    // reqId → { reason, budgets, triedBackendIds }
+
+// ==================== 自动重试（400 / 431 / 429 / 502 / 504 / 连接失败） ====================
+// 统一重试预算结构: { reason:'400'|'502', budgets:{400:{same,backends},502:{same,backends}}, tried*:Set }
+// budgets[r].same = 同一节点最多重试次数；budgets[r].backends = 最多换节点次数
+function retryBudgets() {
+  return {
+    400: {
+      same: CONFIG.retry_400_enabled ? (CONFIG.retry_400_max || 2) : 0,
+      backends: CONFIG.retry_400_enabled ? (CONFIG.retry_400_max_backends || 3) - 1 : 0,
+    },
+    502: {
+      same: CONFIG.retry_502_enabled ? (CONFIG.retry_502_max || 2) : 0,
+      backends: CONFIG.retry_502_enabled ? (CONFIG.retry_502_max_backends || 3) - 1 : 0,
+    },
+  };
+}
+function anyRetryEnabled() {
+  return !!(CONFIG.retry_400_enabled || CONFIG.retry_502_enabled);
+}
+function retryAllowed(reason) {
+  return reason === '400' ? !!CONFIG.retry_400_enabled : !!CONFIG.retry_502_enabled;
+}
+
+/** 管理日志只保留路径和查询参数数量，避免 buffer/sign 等大字段泄露或刷屏。 */
+function displayRequestPath(url) {
+  const text = String(url || '/');
+  const queryIndex = text.indexOf('?');
+  if (queryIndex === -1) return text;
+  const query = text.slice(queryIndex + 1);
+  const count = query ? query.split('&').filter(Boolean).length : 0;
+  return `${text.slice(0, queryIndex) || '/'}?…${count ? `(${count})` : ''}`;
+}
+function retryReasonForStatus(statusCode) {
+  return statusCode === 400 ? '400' : '502';
+}
+function isRetryableUpstreamStatus(statusCode) {
+  return statusCode === 400 || statusCode === 431 || statusCode === 429 || statusCode === 502 || statusCode === 504;
+}
+/** QSign 常以 HTTP 200 包装业务错误；把其中可重试的 code 视为对应上游状态。 */
+function getRetryableResponseStatus(statusCode, body) {
+  if (isRetryableUpstreamStatus(statusCode)) return statusCode;
+  if (statusCode < 200 || statusCode >= 300 || !body || body.length === 0) return null;
+  try {
+    const payload = JSON.parse(Buffer.isBuffer(body) ? body.toString('utf8') : String(body));
+    const code = Number(payload?.code);
+    return isRetryableUpstreamStatus(code) ? code : null;
+  } catch (_) {
+    return null;
+  }
+}
+function retrySameMax(reason) {
+  return reason === '400' ? (CONFIG.retry_400_max || 2) : (CONFIG.retry_502_max || 2);
+}
+function isSuccessfulStatus(statusCode) {
+  return statusCode >= 200 && statusCode < 400;
+}
+function normalizeBackendWeight(value) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isInteger(parsed) ? Math.min(10000, Math.max(1, parsed)) : 1;
+}
 const MAX_SHOWN_LOGS = 200; // 日志前端最多展示量，但后端全量保留
 const stats = {
   totalRequests: 0, successRequests: 0, failRequests: 0,
@@ -409,11 +574,25 @@ const stats = {
 };
 const wsSubscribers = new Set();    // 管理页面前端 WebSocket 订阅者
 
-/** 从 historyRequests 计算近3分钟平均每秒请求数 */
-function calcRps(s) {
-  const arr = s.historyRequests || [];
-  const recent = arr.slice(-3).filter(v => v > 0);
-  return recent.length ? Math.round(recent.reduce((a, b) => a + b, 0) / recent.length / 60) : 0;
+// RPS 以进入代理入口的真实请求计数；不把重试和日志刷新当成新请求。
+const recentRequestTimes = [];
+let recentRequestHead = 0;
+function pruneRequestTimes(now) {
+  const cutoff = now - 1000;
+  while (recentRequestHead < recentRequestTimes.length && recentRequestTimes[recentRequestHead] <= cutoff) recentRequestHead++;
+  if (recentRequestHead > 4096 && recentRequestHead * 2 >= recentRequestTimes.length) {
+    recentRequestTimes.splice(0, recentRequestHead);
+    recentRequestHead = 0;
+  }
+}
+function recordIncomingRequest() {
+  const now = Date.now();
+  recentRequestTimes.push(now);
+  pruneRequestTimes(now);
+}
+function calcRps() {
+  pruneRequestTimes(Date.now());
+  return recentRequestTimes.length - recentRequestHead;
 }
 
 // 持久化后端节点（所有类型）
@@ -422,10 +601,10 @@ function saveBackends() {
   for (const [, b] of backends) {
     // HTTP 后端完整保存；tunnel/frp 保存配置以便重连时恢复偏好
     if (b.type === 'http') {
-      list.push({ id: b.id, type: b.type, url: b.url, weight: b.weight, tag: b.tag || '', group: b.group || 'default', disable_health_check: !!b.disable_health_check, disabled: !!b.disabled, createdAt: b.createdAt });
+      list.push({ id: b.id, type: b.type, url: b.url, weight: b.weight, tag: b.tag || '', group: backendGroupNames(b)[0], groups: backendGroupNames(b), disable_health_check: !!b.disable_health_check, query_to_json_enabled: !!b.query_to_json_enabled, post_to_get_enabled: !!b.post_to_get_enabled, disabled: !!b.disabled, createdAt: b.createdAt });
     } else {
       // tunnel / frp：保存偏好配置（ID 会变，用 tag 匹配恢复）
-      list.push({ type: b.type, tag: b.tag || '', weight: b.weight || 1, group: b.group || 'default', disable_health_check: !!b.disable_health_check, disabled: !!b.disabled, _preference: true });
+      list.push({ type: b.type, tag: b.tag || '', weight: b.weight || 1, group: backendGroupNames(b)[0], groups: backendGroupNames(b), disable_health_check: !!b.disable_health_check, query_to_json_enabled: !!b.query_to_json_enabled, post_to_get_enabled: !!b.post_to_get_enabled, disabled: !!b.disabled, _preference: true });
     }
   }
   CONFIG._backends = list;
@@ -435,19 +614,132 @@ function loadBackends() {
   const list = CONFIG._backends || [];
   for (const b of list) {
     if (b.type === 'http' && b.url) {
-      backends.set(b.id, {
-        id: b.id, type: 'http', url: b.url, weight: b.weight || 1, tag: b.tag || '',
-        group: b.group || 'default', alive: !b.disabled, connections: 0, responseTime: 0,
+      const backend = {
+        id: b.id, type: 'http', url: b.url, weight: normalizeBackendWeight(b.weight), tag: b.tag || '',
+        alive: !b.disabled, connections: 0, responseTime: 0,
         totalRequests: 0, successRequests: 0, failRequests: 0,
-        disable_health_check: !!b.disable_health_check,
+        disable_health_check: !!b.disable_health_check, query_to_json_enabled: !!b.query_to_json_enabled, post_to_get_enabled: !!b.post_to_get_enabled,
         disabled: !!b.disabled,
         createdAt: b.createdAt || Date.now(), lastCheck: Date.now()
-      });
+      };
+      setBackendGroups(backend, b.groups || b.group || 'default');
+      backends.set(b.id, backend);
     }
   }
   // 保存 tunnel/frp 偏好配置供 Agent 重连时恢复
   CONFIG._backend_prefs = list.filter(b => b._preference);
   console.log(`  📦 已恢复 ${backends.size} 个后端节点`);
+}
+
+function normalizeBackendUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.protocol}//${parsed.host}${parsed.pathname.replace(/\/+$/, '') || '/'}`;
+  } catch (_) {
+    return '';
+  }
+}
+
+/**
+ * 仅在运行目录存在 enabled=true 的 node-bootstrap.json 时执行一次节点配置合并。
+ * 正常模式只更新同 URL 节点；紧急恢复模式可显式清除全部节点的格式转换并停用目标节点。
+ */
+function applyNodeBootstrap() {
+  try {
+    if (!fs.existsSync(NODE_BOOTSTRAP_PATH)) return false;
+    const data = JSON.parse(fs.readFileSync(NODE_BOOTSTRAP_PATH, 'utf8'));
+    const removeRuleKeys = Array.isArray(data.removeBootstrapRules) ? new Set(data.removeBootstrapRules.map(String)) : null;
+    if (removeRuleKeys && removeRuleKeys.size > 0) {
+      const before = rules.length;
+      rules = rules.filter(rule => !removeRuleKeys.has(String(rule._bootstrapKey || '')));
+      updateSortedRules();
+      CONFIG.groups = groups;
+      CONFIG.rules = rules;
+      saveBackends();
+      console.log(`  ✅ 已移除 ${before - rules.length} 条固定节点规则`);
+      return true;
+    }
+    if (data.resetAllFormatTransforms) {
+      for (const item of backends.values()) {
+        if (item.type !== 'http') continue;
+        item.query_to_json_enabled = false;
+        item.post_to_get_enabled = false;
+      }
+    }
+    const targetUrlForRecovery = normalizeBackendUrl(data.url);
+    if (data.disableTarget && targetUrlForRecovery) {
+      const target = Array.from(backends.values()).find(item => item.type === 'http' && normalizeBackendUrl(item.url) === targetUrlForRecovery);
+      if (target) {
+        target.disabled = true;
+        target.alive = false;
+        target.query_to_json_enabled = false;
+        target.post_to_get_enabled = false;
+      }
+      CONFIG.groups = groups;
+      CONFIG.rules = rules;
+      saveBackends();
+      console.log(`  ✅ 节点恢复已生效: 已清除格式转换${target ? `，并停用 ${target.tag || target.url}` : ''}`);
+      return true;
+    }
+    const normalizedUrl = data.enabled ? normalizeBackendUrl(data.url) : '';
+    const groupName = String(data.group || '').trim();
+    if (!normalizedUrl || !groupName) return false;
+    if (!groups[groupName]) groups[groupName] = { algorithm: 'weighted-round-robin', description: '' };
+
+    let backend = Array.from(backends.values()).find(item => item.type === 'http' && normalizeBackendUrl(item.url) === normalizedUrl);
+    if (!backend) {
+      backend = {
+        id: uuidv4(), type: 'http', url: data.url, weight: normalizeBackendWeight(data.weight),
+        tag: String(data.tag || '').slice(0, 100), group: groupName, groups: [groupName],
+        alive: true, connections: 0, responseTime: 0, totalRequests: 0, successRequests: 0, failRequests: 0,
+        disable_health_check: !!data.disable_health_check,
+        query_to_json_enabled: !!data.query_to_json_enabled,
+        post_to_get_enabled: !!data.post_to_get_enabled,
+        disabled: false, createdAt: Date.now(), lastCheck: Date.now()
+      };
+      backends.set(backend.id, backend);
+    } else {
+      setBackendGroups(backend, data.groups || groupName);
+      backend.weight = normalizeBackendWeight(data.weight ?? backend.weight);
+      backend.tag = String(data.tag || backend.tag || '').slice(0, 100);
+      backend.disable_health_check = !!data.disable_health_check;
+      backend.query_to_json_enabled = !!data.query_to_json_enabled;
+      backend.post_to_get_enabled = !!data.post_to_get_enabled;
+      if (backend.query_to_json_enabled) backend.post_to_get_enabled = false;
+      backend.disabled = false;
+      backend.alive = true;
+      backend.lastCheck = Date.now();
+    }
+    const bootstrapRules = Array.isArray(data.rules) ? data.rules : [];
+    for (const spec of bootstrapRules) {
+      const key = String(spec.key || '').trim();
+      const matchType = String(spec.matchType || 'prefix').trim();
+      const rulePath = String(spec.path || '').trim();
+      const targetGroup = String(spec.group || groupName).trim();
+      const targetUrl = normalizeBackendUrl(spec.backendUrl || data.url);
+      if (!key || !RULE_MATCH_TYPES.has(matchType) || !rulePath || !groups[targetGroup] || !targetUrl) continue;
+      const ruleData = {
+        _bootstrapKey: key,
+        matchType,
+        path: rulePath,
+        group: targetGroup,
+        priority: Number.isFinite(Number(spec.priority)) ? Number(spec.priority) : 0,
+        backendUrl: targetUrl
+      };
+      const existing = rules.find(rule => rule._bootstrapKey === key);
+      if (existing) Object.assign(existing, ruleData);
+      else rules.push({ id: `bootstrap:${key}`, ...ruleData });
+    }
+    updateSortedRules();
+    CONFIG.groups = groups;
+    CONFIG.rules = rules;
+    saveBackends();
+    console.log(`  ✅ 节点引导已生效: ${backend.tag || backend.url} → ${groupName}`);
+    return true;
+  } catch (e) {
+    console.error(`  ⚠️ 节点引导配置无效，已忽略: ${e.message}`);
+    return false;
+  }
 }
 
 // ==================== FRPS（标准 frpc TLS 协议） ====================
@@ -573,7 +865,7 @@ function handleFrpConnection(socket, initialChunk) {
         const backendId = uuidv4();
         const backend = {
           id: backendId, type: 'frp', tag: ctrlProxyName,
-          group: frpPrefs?.group || g, weight: frpPrefs?.weight || 1,
+          weight: normalizeBackendWeight(frpPrefs?.weight), query_to_json_enabled: !!frpPrefs?.query_to_json_enabled, post_to_get_enabled: !!frpPrefs?.post_to_get_enabled,
           alive: !(frpPrefs?.disabled), connections: 0, responseTime: 0,
           totalRequests: 0, successRequests: 0, failRequests: 0,
           disable_health_check: frpPrefs?.disable_health_check || false,
@@ -582,6 +874,7 @@ function handleFrpConnection(socket, initialChunk) {
           remoteAddress: socket.remoteAddress || 'unknown',
           connectedAt: Date.now(), frpProxyName: ctrlProxyName
         };
+        setBackendGroups(backend, frpPrefs?.groups || frpPrefs?.group || g);
         if (frpPrefs) console.log(`  📋 恢复 ${ctrlProxyName} 偏好: group=${backend.group} hc=${backend.disable_health_check ? 'off' : 'on'}`);
         backends.set(backendId, backend);
         frpControlConns.set(ctrlProxyName, { socket, backendId, group: g });
@@ -713,14 +1006,42 @@ function parseRawHttpResponse(buffer, requestMethod, ended) {
 }
 
 function forwardViaFrp(req, res, backend, retryState) {
+  req._lbBackendId = backend.id;
+  prepareForwardRequest(req);
   const proxyName = backend.frpProxyName;
   const ctrl = frpControlConns.get(proxyName);
+  if (!retryState) retryState = { budgets: retryBudgets(), triedIds: new Set() };
+  retryState.triedIds.add(backend.id);
+
+  // 502/504/传输失败：先重试当前 frp 节点，耗尽后再换节点。
+  const failover502 = (workSocket, note) => {
+    if (!CONFIG.retry_502_enabled) return false;
+    const b = retryState.budgets['502'];
+    if (b.same > 0) {
+      b.same--;
+      try { workSocket && workSocket.destroy(); } catch (_) {}
+      console.log(`  🔄 [502 重试·FRP·${note}·同节点] ${req.method} ${req.url} → ${backend.tag}  (剩余 ${b.same} 次)`);
+      forwardViaFrp(req, res, backend, retryState);
+      return true;
+    }
+    if (b.backends > 0) {
+      const nb = selectBackend(req, req._lbGroup || 'default', retryState.triedIds);
+      if (nb && nb.type === 'frp') {
+        b.backends--;
+        b.same = CONFIG.retry_502_max || 2;
+        try { workSocket && workSocket.destroy(); } catch (_) {}
+        console.log(`  🔄 [502 重试·FRP·${note}·换节点] ${req.method} ${req.url} ${backend.tag} → ${nb.tag}  (还可换 ${b.backends} 个)`);
+        forwardViaFrp(req, res, nb, retryState);
+        return true;
+      }
+    }
+    return false;
+  };
+
   if (!ctrl || !ctrl.socket.writable) {
+    if (failover502(null, '控制连接不可用')) return;
     return res.status(502).json({ ret: -1, error: 'frpc 控制连接不可用' });
   }
-
-  if (!retryState) retryState = { sameRetriesLeft: CONFIG.retry_400_max || 2, backendsLeft: (CONFIG.retry_400_max_backends || 3) - 1, triedIds: new Set() };
-  retryState.triedIds.add(backend.id);
   const startTime = Date.now();
   backend.connections = (backend.connections || 0) + 1;
 
@@ -761,7 +1082,7 @@ function forwardViaFrp(req, res, backend, retryState) {
     }
     const headStr = lines.join('\r\n') + '\r\n\r\n';
     workSocket.write(headStr);
-    if (req._rawBody && req._rawBody.length > 0) workSocket.write(req._rawBody);
+    if (req._lbForwardBody && req._lbForwardBody.length > 0) workSocket.write(req._lbForwardBody);
     workSocket.end();
 
     // 读取响应：TCP 可能分片，必须等到 Content-Length/chunked/FIN 明确完成。
@@ -781,33 +1102,35 @@ function forwardViaFrp(req, res, backend, retryState) {
       }
 
       if (!parsed || parsed.error) {
+        if (failover502(workSocket, '解析失败')) return;
         const log = recordLog(req, backend, { success: false, responseTime: rt, statusCode: 502 });
         broadcast({ type: 'new_log', log });
         return res.status(502).json({ ret: -1, error: 'frp 响应解析失败' });
       }
       const { statusCode, headers, body } = parsed;
 
-      // ── 400 自动重试（FRP，先同节点再换节点） ──
-      if (CONFIG.retry_400_enabled && statusCode === 400) {
-        // 策略1: 先在当前节点重试
-        if (retryState.sameRetriesLeft > 0) {
-          retryState.sameRetriesLeft--;
-          console.log(`  🔄 [400 重试·FRP·同节点] ${req.method} ${req.url} → ${backend.tag}  (剩余 ${retryState.sameRetriesLeft} 次)`);
-          backend.connections = Math.max(0, (backend.connections || 0) - 1);
-          workSocket.destroy();
-          return forwardViaFrp(req, res, backend, retryState);
-        }
-        // 策略2: 换节点
-        if (retryState.backendsLeft > 0) {
-          const group = req._lbGroup || 'default';
-          const newBackend = selectBackend(req, group, retryState.triedIds);
-          if (newBackend && newBackend.type === 'frp') {
-            retryState.backendsLeft--;
-            retryState.sameRetriesLeft = CONFIG.retry_400_max || 2;
-            console.log(`  🔄 [400 重试·FRP·换节点] ${req.method} ${req.url}  ${backend.tag} → ${newBackend.tag}  (还可换 ${retryState.backendsLeft} 个)`);
+      // ── 400/431/429/502/504 自动重试（FRP，先同节点再换节点） ──
+      if (isRetryableUpstreamStatus(statusCode)) {
+        const reason = retryReasonForStatus(statusCode);
+        if (retryAllowed(reason)) {
+          const b = retryState.budgets[reason];
+          if (b.same > 0) {
+            b.same--;
+            console.log(`  🔄 [${statusCode} 重试·FRP·同节点] ${req.method} ${req.url} → ${backend.tag}  (剩余 ${b.same} 次)`);
             backend.connections = Math.max(0, (backend.connections || 0) - 1);
             workSocket.destroy();
-            return forwardViaFrp(req, res, newBackend, retryState);
+            return forwardViaFrp(req, res, backend, retryState);
+          }
+          if (b.backends > 0) {
+            const newBackend = selectBackend(req, req._lbGroup || 'default', retryState.triedIds);
+            if (newBackend && newBackend.type === 'frp') {
+              b.backends--;
+              b.same = retrySameMax(reason);
+              console.log(`  🔄 [${statusCode} 重试·FRP·换节点] ${req.method} ${req.url}  ${backend.tag} → ${newBackend.tag}  (还可换 ${b.backends} 个)`);
+              backend.connections = Math.max(0, (backend.connections || 0) - 1);
+              workSocket.destroy();
+              return forwardViaFrp(req, res, newBackend, retryState);
+            }
           }
         }
       }
@@ -826,7 +1149,7 @@ function forwardViaFrp(req, res, backend, retryState) {
       } catch (_) {}
       res.status(statusCode).end(body);
 
-      const log = recordLog(req, backend, { success: true, responseTime: rt, statusCode });
+      const log = recordLog(req, backend, { success: isSuccessfulStatus(statusCode), responseTime: rt, statusCode });
       broadcast({ type: 'new_log', log });
       workSocket.destroy();
     };
@@ -847,6 +1170,7 @@ function forwardViaFrp(req, res, backend, retryState) {
       clearTimeout(responseTimer);
       backend.connections = Math.max(0, (backend.connections || 0) - 1);
       const rt = Date.now() - startTime;
+      if (failover502(workSocket, 'work_conn 错误')) return;
       const log = recordLog(req, backend, { success: false, responseTime: rt, statusCode: 502 });
       broadcast({ type: 'new_log', log });
       try { res.status(502).json({ ret: -1, error: 'frp work_conn 错误' }); } catch (_) {}
@@ -855,6 +1179,7 @@ function forwardViaFrp(req, res, backend, retryState) {
     clearTimeout(timer);
     backend.connections = Math.max(0, (backend.connections || 0) - 1);
     const rt = Date.now() - startTime;
+    if (failover502(null, '隧道失败')) return;
     const log = recordLog(req, backend, { success: false, responseTime: rt, statusCode: 504 });
     broadcast({ type: 'new_log', log });
     if (!res.writableEnded && !res.destroyed) {
@@ -892,8 +1217,188 @@ proxy.on('proxyReq', (proxyReq, req) => {
   }
 });
 
-/** 用原生 http.request 重新发送请求到指定 target（400 重试用） */
+/** 为一次重试选择下一个 HTTP 目标：始终先同节点，耗尽后才换节点。 */
+function pickHttpRetryTarget(origReq, retryInfo, reason) {
+  // 调试路由必须始终固定到指定节点，绝不能回落到正常用户的节点池。
+  if (origReq._lbDebugRoute) return null;
+  if (!retryInfo || !retryInfo.budgets) return null;
+  const budget = retryInfo.budgets[reason];
+  if (!budget || !retryAllowed(reason)) return null;
+  const currentBackend = backends.get(origReq._lbBackendId);
+  const canSame = !!(currentBackend && currentBackend.type === 'http' && currentBackend.url);
+
+  if (budget.same > 0 && canSame) {
+    budget.same--;
+    return { target: currentBackend.url, switched: false };
+  }
+  // 命中固定节点规则时，不能把节点专属格式转换发送给其他节点。
+  if (normalizeBackendUrl(origReq._lbMatchedRule?.backendUrl || '')) return null;
+  if (budget.backends > 0) {
+    const group = origReq._lbGroup || 'default';
+    const newBackend = selectBackend(origReq, group, retryInfo.triedBackendIds);
+    if (newBackend && newBackend.type === 'http' && newBackend.url) {
+      retryInfo.triedBackendIds.add(newBackend.id);
+      budget.backends--;
+      budget.same = retrySameMax(reason);
+      if (currentBackend) currentBackend.connections = Math.max(0, (currentBackend.connections || 0) - 1);
+      origReq._lbBackendId = newBackend.id;
+      newBackend.connections = (newBackend.connections || 0) + 1;
+      return { target: newBackend.url, switched: true };
+    }
+  }
+  return null;
+}
+
+function appendQueryString(url, query) {
+  if (!query) return url;
+  if (!url.includes('?')) return `${url}?${query}`;
+  return `${url}${url.endsWith('?') || url.endsWith('&') ? '' : '&'}${query}`;
+}
+
+/** 合并 POST Body 的 Query；同名参数以 Body 为准，避免大字段（如 buffer）重复两次。 */
+function mergeBodyQueryIntoUrl(url, bodyQuery) {
+  if (!bodyQuery) return url;
+  const queryIndex = url.indexOf('?');
+  if (queryIndex === -1 || queryIndex === url.length - 1) return appendQueryString(url, bodyQuery);
+  const current = new URLSearchParams(url.slice(queryIndex + 1));
+  const incoming = new URLSearchParams(bodyQuery);
+  const incomingKeys = new Set();
+  for (const [key] of incoming) incomingKeys.add(key);
+  if (![...incomingKeys].some(key => current.has(key))) return appendQueryString(url, bodyQuery);
+  for (const key of incomingKeys) current.delete(key);
+  for (const [key, value] of incoming) current.append(key, value);
+  return `${url.slice(0, queryIndex)}?${current.toString()}`;
+}
+
+/** 将 JSON 或 form 请求体转换成 URL Query；无法安全转换的二进制体返回 null。 */
+function bodyToQuery(body, contentType) {
+  if (!body || body.length === 0) return '';
+  const text = Buffer.isBuffer(body) ? body.toString('utf8') : String(body);
+  const ct = String(contentType || '').toLowerCase();
+  if (ct.includes('application/x-www-form-urlencoded')) return text;
+  // 部分旧客户端未带 Content-Type，或误标成 JSON，但实际 body 是标准 form。
+  // 仅识别 key=value&... 形态，不能识别时仍保持原请求，避免误转二进制/文本协议。
+  if (!text.trimStart().startsWith('{') && /^[^=&\s]+=[\s\S]*$/.test(text)) return text;
+  if (!ct.includes('application/json') && !text.trimStart().startsWith('{')) return null;
+  let value;
+  try { value = JSON.parse(text); } catch (_) { return null; }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const params = new URLSearchParams();
+  for (const [key, item] of Object.entries(value)) {
+    const values = Array.isArray(item) ? item : [item];
+    for (const entry of values) {
+      if (entry === undefined) continue;
+      params.append(key, entry && typeof entry === 'object' ? JSON.stringify(entry) : String(entry));
+    }
+  }
+  return params.toString();
+}
+
+function paramsToPayload(params) {
+  const payload = {};
+  for (const [key, value] of params) {
+    if (Object.prototype.hasOwnProperty.call(payload, key)) {
+      payload[key] = Array.isArray(payload[key]) ? [...payload[key], value] : [payload[key], value];
+    } else {
+      payload[key] = value;
+    }
+  }
+  return payload;
+}
+
+/** 仅接受非空的标准 form 内容，避免把二进制或普通文本误转成 JSON。 */
+function formBodyToPayload(body) {
+  if (!body || body.length === 0) return null;
+  const text = (Buffer.isBuffer(body) ? body : Buffer.from(body)).toString('utf8').trim();
+  if (!text || text.startsWith('{') || text.startsWith('[') || !text.includes('=')) return null;
+  const params = new URLSearchParams(text);
+  if ([...params].length === 0) return null;
+  return paramsToPayload(params);
+}
+
+/** 按当前目标节点恢复并准备转发请求；两种请求形态转换均为节点级选项。 */
+function prepareForwardRequest(req) {
+  if (!req._lbSourceRequest) {
+    req._lbSourceRequest = {
+      // 转发源必须保留原始 URL；日志显示时才使用 displayRequestPath，不能混用。
+      url: req.url,
+      method: req.method,
+      headers: { ...req.headers },
+      body: req._lbOriginalBody ? Buffer.from(req._lbOriginalBody) : (req._rawBody ? Buffer.from(req._rawBody) : null)
+    };
+  }
+  const source = req._lbSourceRequest;
+  const sourceUrl = source.url;
+  req.url = sourceUrl;
+  req.method = source.method;
+  req.headers = { ...source.headers };
+  req._lbOriginalBody = source.body ? Buffer.from(source.body) : null;
+  req._lbForwardBody = req._lbOriginalBody;
+
+  const backend = backends.get(req._lbBackendId) || req._lbBackend;
+  req._lbAppliedTransform = null;
+  const preserveOriginal = !!(backend && req._lbOriginalFormatBackendIds?.has(backend.id));
+  const queryIndex = sourceUrl.indexOf('?');
+  if (!preserveOriginal && backend?.query_to_json_enabled) {
+    let payload = null;
+    let transform = null;
+    if (queryIndex !== -1 && queryIndex !== sourceUrl.length - 1) {
+      try {
+        const search = new URL(sourceUrl, 'http://lb.local').searchParams;
+        if ([...search].length > 0) {
+          payload = paramsToPayload(search);
+          transform = 'query_to_json';
+        }
+      } catch (_) {}
+    } else if (String(source.method).toUpperCase() === 'POST') {
+      payload = formBodyToPayload(source.body);
+      if (payload) transform = 'form_to_json';
+    }
+    if (payload) {
+      const body = Buffer.from(JSON.stringify(payload));
+      req.url = queryIndex >= 0 ? (sourceUrl.slice(0, queryIndex) || '/') : sourceUrl;
+      req.method = 'POST';
+      delete req.headers['transfer-encoding'];
+      req.headers['content-type'] = 'application/json';
+      req.headers['content-length'] = String(body.length);
+      req._lbOriginalBody = body;
+      req._lbForwardBody = body;
+      req._lbAppliedTransform = transform;
+    }
+  }
+
+  if (!preserveOriginal && backend?.post_to_get_enabled && String(req.method).toUpperCase() === 'POST') {
+    const query = bodyToQuery(req._lbForwardBody, req.headers['content-type']);
+    if (query !== null) {
+      req.url = mergeBodyQueryIntoUrl(req.url, query);
+      req.method = 'GET';
+      delete req.headers['transfer-encoding'];
+      delete req.headers['content-type'];
+      delete req.headers['content-length'];
+      req._lbOriginalBody = null;
+      req._lbForwardBody = null;
+      req._lbAppliedTransform = 'post_to_get';
+    }
+  }
+}
+
+/** 转换格式被上游拒绝时，先用原始请求形态在同一节点回退一次。 */
+function retryOriginalFormat(req, realRes, retryInfo, reqId, statusCode) {
+  const backend = backends.get(req._lbBackendId) || req._lbBackend;
+  if (!backend || backend.type !== 'http' || !backend.url || !req._lbAppliedTransform) return false;
+  // 该节点明确要求 GET 时，绝不因失败回退为 POST；POST 是不兼容的协议形态。
+  if (req._lbAppliedTransform === 'post_to_get') return false;
+  if (!req._lbOriginalFormatBackendIds) req._lbOriginalFormatBackendIds = new Set();
+  if (req._lbOriginalFormatBackendIds.has(backend.id)) return false;
+  req._lbOriginalFormatBackendIds.add(backend.id);
+  console.log(`  ↩️  [${statusCode} 格式回退] ${req._lbAppliedTransform} → 原始请求  ${req.method} ${displayRequestPath(req.url)} → ${backend.url}`);
+  retryHttpRequest(req, realRes, backend.url, retryInfo, reqId);
+  return true;
+}
+
+/** 用原生 http.request 重新发送请求到指定 target（400/431/429/502/504 自动重试用） */
 function retryHttpRequest(origReq, realRes, target, retryInfo, reqId) {
+  prepareForwardRequest(origReq);
   const targetUrl = new URL(target);
   const isHttps = targetUrl.protocol === 'https:';
   const mod = isHttps ? require('https') : require('http');
@@ -919,64 +1424,43 @@ function retryHttpRequest(origReq, realRes, target, retryInfo, reqId) {
     headers,
     timeout: CONFIG.tunnel_timeout || 30000,
   }, (upstreamRes) => {
-    const rt = Date.now() - startTime;
-
-    // 又是 400 且还能重试 → 递归
-    if (upstreamRes.statusCode === 400) {
-      upstreamRes.resume(); // 静默消费
-      if (retryInfo.sameRetriesLeft > 0 || retryInfo.backendsLeft > 0) {
-        // 选下一个目标
-        const group = origReq._lbGroup || 'default';
-        let nextTarget = null;
-        if (retryInfo.sameRetriesLeft > 0) {
-          retryInfo.sameRetriesLeft--;
-          // 同节点还是当前 target
-          nextTarget = target;
-          console.log(`  🔄 [400 重试·同节点] ${origReq.method} ${origReq.url} → ${target}  (剩余 ${retryInfo.sameRetriesLeft} 次)`);
-        } else if (retryInfo.backendsLeft > 0) {
-          const newBackend = selectBackend(origReq, group, retryInfo.triedBackendIds);
-          if (newBackend && newBackend.type === 'http' && newBackend.url) {
-            retryInfo.triedBackendIds.add(newBackend.id);
-            retryInfo.backendsLeft--;
-            retryInfo.sameRetriesLeft = CONFIG.retry_400_max || 2;
-            nextTarget = newBackend.url;
-            console.log(`  🔄 [400 重试·换节点] ${origReq.method} ${origReq.url} → ${nextTarget}  (还可换 ${retryInfo.backendsLeft} 个)`);
-            const currentBackend = backends.get(origReq._lbBackendId);
-            if (currentBackend) currentBackend.connections = Math.max(0, (currentBackend.connections || 0) - 1);
-            origReq._lbBackendId = newBackend.id;
-            newBackend.connections = (newBackend.connections || 0) + 1;
-          }
-        }
-        if (nextTarget) {
-          return retryHttpRequest(origReq, realRes, nextTarget, retryInfo, reqId);
+    const chunks = [];
+    upstreamRes.on('data', chunk => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+    upstreamRes.on('end', () => {
+      const body = Buffer.concat(chunks);
+      const retryStatus = getRetryableResponseStatus(upstreamRes.statusCode, body);
+      if (retryStatus && retryOriginalFormat(origReq, realRes, retryInfo, reqId, retryStatus)) return;
+      if (retryStatus) {
+        const reason = retryReasonForStatus(retryStatus);
+        const next = pickHttpRetryTarget(origReq, retryInfo, reason);
+        if (next && next.target) {
+          const tag = next.switched ? '换节点' : '同节点';
+          const remain = next.switched
+            ? `还可换 ${retryInfo.budgets[reason].backends} 个`
+            : `剩余 ${retryInfo.budgets[reason].same} 次`;
+          console.log(`  🔄 [${retryStatus} 重试·${tag}] ${origReq.method} ${displayRequestPath(origReq.url)} → ${next.target}  (${remain})`);
+          return retryHttpRequest(origReq, realRes, next.target, retryInfo, reqId);
         }
       }
-      // 没法再重试，把 400 返回给客户端
-      sendUpstreamToClient(upstreamRes, realRes, origReq, rt);
-      finalizeRetriedRequest(origReq, upstreamRes.statusCode, Date.now() - (origReq._lbStartTime || startTime));
+      sendBufferedUpstreamToClient(upstreamRes, body, realRes, origReq, Date.now() - startTime);
+      finalizeRetriedRequest(origReq, retryStatus || upstreamRes.statusCode, Date.now() - (origReq._lbStartTime || startTime));
       if (reqId) retryRequests.delete(reqId);
-    } else {
-      sendUpstreamToClient(upstreamRes, realRes, origReq, rt);
-      finalizeRetriedRequest(origReq, upstreamRes.statusCode, Date.now() - (origReq._lbStartTime || startTime));
-      if (reqId) retryRequests.delete(reqId);
-    }
+    });
+    upstreamRes.on('error', () => {
+      try { upstreamRes.resume(); } catch (_) {}
+    });
   });
 
   upstreamReq.on('error', (err) => {
     console.log(`  ⚠️  [重试请求] ${target} 失败: ${err.message}`);
-    if (retryInfo.backendsLeft > 0) {
-      const group = origReq._lbGroup || 'default';
-      const newBackend = selectBackend(origReq, group, retryInfo.triedBackendIds);
-      if (newBackend && newBackend.type === 'http' && newBackend.url) {
-        retryInfo.triedBackendIds.add(newBackend.id);
-        retryInfo.backendsLeft--;
-        retryInfo.sameRetriesLeft = CONFIG.retry_400_max || 2;
-        const currentBackend = backends.get(origReq._lbBackendId);
-        if (currentBackend) currentBackend.connections = Math.max(0, (currentBackend.connections || 0) - 1);
-        origReq._lbBackendId = newBackend.id;
-        newBackend.connections = (newBackend.connections || 0) + 1;
-        return retryHttpRequest(origReq, realRes, newBackend.url, retryInfo, reqId);
-      }
+    const next = pickHttpRetryTarget(origReq, retryInfo, '502');
+    if (next && next.target) {
+      const tag = next.switched ? '换节点' : '同节点';
+      const remain = next.switched
+        ? `还可换 ${retryInfo.budgets['502'].backends} 个`
+        : `剩余 ${retryInfo.budgets['502'].same} 次`;
+      console.log(`  🔄 [502 重试·${tag}] ${origReq.method} ${displayRequestPath(origReq.url)} → ${next.target}  (${remain})`);
+      return retryHttpRequest(origReq, realRes, next.target, retryInfo, reqId);
     }
     try { realRes.status(502).json({ ret: -1, error: '重试失败', message: err.message }); } catch (_) {}
     finalizeRetriedRequest(origReq, 502, Date.now() - (origReq._lbStartTime || startTime));
@@ -994,7 +1478,7 @@ function retryHttpRequest(origReq, realRes, target, retryInfo, reqId) {
 function finalizeRetriedRequest(origReq, statusCode, responseTime) {
   if (origReq._lbRetryFinalized) return;
   origReq._lbRetryFinalized = true;
-  const backend = backends.get(origReq._lbBackendId);
+  const backend = backends.get(origReq._lbBackendId) || origReq._lbBackend;
   if (backend) {
     backend.connections = Math.max(0, (backend.connections || 0) - 1);
     if (responseTime > 0) {
@@ -1003,13 +1487,36 @@ function finalizeRetriedRequest(origReq, statusCode, responseTime) {
         : responseTime;
     }
   }
-  const logEntry = origReq._lbLogEntry;
-  if (logEntry) {
-    logEntry.success = statusCode >= 200 && statusCode < 400;
-    logEntry.responseTime = responseTime;
-    logEntry.statusCode = statusCode;
-    broadcast({ type: 'update_log', log: logEntry });
+  updateHttpLogOutcome(origReq, statusCode, responseTime);
+}
+
+function updateHttpLogOutcome(req, statusCode, responseTime) {
+  const logEntry = req._lbLogEntry;
+  if (!logEntry) return;
+  const success = isSuccessfulStatus(statusCode);
+  if (logEntry.success !== success) {
+    if (success) {
+      stats.failRequests = Math.max(0, stats.failRequests - 1);
+      stats.successRequests++;
+    } else {
+      stats.successRequests = Math.max(0, stats.successRequests - 1);
+      stats.failRequests++;
+    }
+    const countedBackend = backends.get(req._lbLogBackendId);
+    if (countedBackend) {
+      if (success) {
+        countedBackend.failRequests = Math.max(0, (countedBackend.failRequests || 0) - 1);
+        countedBackend.successRequests = (countedBackend.successRequests || 0) + 1;
+      } else {
+        countedBackend.successRequests = Math.max(0, (countedBackend.successRequests || 0) - 1);
+        countedBackend.failRequests = (countedBackend.failRequests || 0) + 1;
+      }
+    }
   }
+  logEntry.success = success;
+  logEntry.responseTime = responseTime;
+  logEntry.statusCode = statusCode;
+  broadcast({ type: 'update_log', log: logEntry });
 }
 
 /** 把上游响应写回客户端（带 LB 标记头） */
@@ -1020,6 +1527,8 @@ function sendUpstreamToClient(upstreamRes, realRes, origReq, rt) {
   // 加 LB 标识头
   try {
     if (!realRes.headersSent) {
+      const backend = backends.get(origReq._lbBackendId) || origReq._lbBackend;
+      if (backend) realRes.setHeader('x-lb-node', backend.url || backend.tag || 'unknown');
       realRes.setHeader('x-lb-group', origReq._lbGroup || 'default');
       realRes.setHeader('x-lb-algorithm', origReq._lbAlgo || getGroupAlgorithm(origReq._lbGroup || 'default'));
       realRes.setHeader('x-lb-response-time', `${rt}ms`);
@@ -1027,6 +1536,25 @@ function sendUpstreamToClient(upstreamRes, realRes, origReq, rt) {
   } catch (_) {}
   realRes.writeHead(upstreamRes.statusCode, headers);
   upstreamRes.pipe(realRes);
+}
+
+function sendBufferedUpstreamToClient(upstreamRes, body, realRes, origReq, rt) {
+  const headers = { ...upstreamRes.headers };
+  delete headers['transfer-encoding'];
+  delete headers['connection'];
+  try {
+    if (!realRes.headersSent) {
+      const backend = backends.get(origReq._lbBackendId) || origReq._lbBackend;
+      if (backend) realRes.setHeader('x-lb-node', backend.url || backend.tag || 'unknown');
+      realRes.setHeader('x-lb-group', origReq._lbGroup || 'default');
+      realRes.setHeader('x-lb-algorithm', origReq._lbAlgo || getGroupAlgorithm(origReq._lbGroup || 'default'));
+      realRes.setHeader('x-lb-response-time', `${rt}ms`);
+    }
+  } catch (_) {}
+  try {
+    realRes.writeHead(upstreamRes.statusCode, headers);
+    realRes.end(body);
+  } catch (_) {}
 }
 
 /** 创建缓冲响应包装器 — 收集后端响应，决定是否重试后再发送给客户端
@@ -1078,6 +1606,12 @@ function createBufferedRes(realRes) {
   });
   Object.defineProperty(wrapper, 'finished', { enumerable: true, get: () => wrapper.writableFinished });
   Object.defineProperty(wrapper, 'headersSent', { enumerable: true, get: () => false });
+  // http-proxy 用 `res.statusCode = ...` 属性赋值写状态码（不调用 writeHead），需同步捕获
+  Object.defineProperty(wrapper, 'statusCode', {
+    configurable: true,
+    get() { return buf.status; },
+    set(value) { if (Number.isInteger(value) && value >= 100 && value <= 599) buf.status = value; }
+  });
   return wrapper;
 }
 
@@ -1090,67 +1624,38 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
   const retryInfo = reqId ? retryRequests.get(reqId) : null;
   const isBufferedRes = res._buf !== undefined;
 
-  // ── 缓冲模式下的 400 自动重试 ──
-  if (isBufferedRes && CONFIG.retry_400_enabled && proxyRes.statusCode === 400 && retryInfo) {
-    const oldBackend = backends.get(backendId);
-    let nextTarget = null;
-    let reason = '';
-
-    // 策略1: 先在当前节点重试
-    if (retryInfo.sameRetriesLeft > 0) {
-      retryInfo.sameRetriesLeft--;
-      if (oldBackend && oldBackend.type === 'http' && oldBackend.url) {
-        nextTarget = oldBackend.url;
-        reason = '同节点';
-      } else {
-        // tunnel/frp 后端没法用 proxy.web 重试（无 URL），跳过同节点直接换
-        retryInfo.sameRetriesLeft = 0;
-      }
-    }
-    // 策略2: 换节点重试
-    if (!nextTarget && retryInfo.backendsLeft > 0) {
-      retryInfo.triedBackendIds.add(backendId);
-      const group = req._lbGroup || 'default';
-      const newBackend = selectBackend(req, group, retryInfo.triedBackendIds);
-      if (newBackend) {
-        retryInfo.backendsLeft--;
-        retryInfo.sameRetriesLeft = CONFIG.retry_400_max || 2;
-        if (newBackend.type === 'http' && newBackend.url) {
-          nextTarget = newBackend.url;
-          reason = '换节点';
-        } else {
-          // tunnel/frp 后端有专门的 forwardViaTunnel/forwardViaFrp 处理，超出 buffered 范围
-          nextTarget = null;
-        }
-        if (oldBackend) oldBackend.connections = Math.max(0, (oldBackend.connections || 0) - 1);
-        if (newBackend) {
-          req._lbBackendId = newBackend.id;
-          newBackend.connections = (newBackend.connections || 0) + 1;
-        }
-      }
-    }
-
-    if (nextTarget) {
-      console.log(`  🔄 [400 重试·${reason}] ${req.method} ${req.url} → ${nextTarget}  (${reason === '同节点' ? '剩余 ' + retryInfo.sameRetriesLeft + ' 次' : '还可换 ' + retryInfo.backendsLeft + ' 个'})`);
-      // 静默消费旧响应
-      proxyRes.on('data', () => {});
+  // ── 缓冲模式下的 400/431/429/502/504 自动重试（先同节点，再换节点） ──
+  if (isBufferedRes && retryInfo && isRetryableUpstreamStatus(proxyRes.statusCode)) {
+    const reason = retryReasonForStatus(proxyRes.statusCode);
+    if (retryOriginalFormat(req, res._realRes, retryInfo, reqId, proxyRes.statusCode)) {
       proxyRes.resume();
-      // 用原生 http.request 重新发请求（避免 http-proxy 在同一 req 上重用的状态问题）
-      retryHttpRequest(req, res._realRes, nextTarget, retryInfo, reqId);
       return;
+    }
+    if (retryAllowed(reason)) {
+      const next = pickHttpRetryTarget(req, retryInfo, reason);
+      if (next && next.target) {
+        const tag = next.switched ? '换节点' : '同节点';
+        const remain = next.switched
+          ? `还可换 ${retryInfo.budgets[reason].backends} 个`
+          : `剩余 ${retryInfo.budgets[reason].same} 次`;
+        console.log(`  🔄 [${proxyRes.statusCode} 重试·${tag}] ${req.method} ${displayRequestPath(req.url)} → ${next.target}  (${remain})`);
+        // 静默消费旧响应
+        proxyRes.on('data', () => {});
+        proxyRes.resume();
+        // 用原生 http.request 重新发请求（避免 http-proxy 在同一 req 上重用的状态问题）
+        retryHttpRequest(req, res._realRes, next.target, retryInfo, reqId);
+        return;
+      }
     }
   }
 
   // ── 正常路径 ──
-  if (backendId && backends.has(backendId)) {
-    const b = backends.get(backendId);
+  if (backendId && (backends.has(backendId) || req._lbBackend)) {
+    const b = backends.get(backendId) || req._lbBackend;
     b.responseTime = b.responseTime ? Math.round(b.responseTime * 0.7 + responseTime * 0.3) : responseTime;
     b.connections = Math.max(0, (b.connections || 0) - 1);
     if (logEntry) {
-      logEntry.success = true;
-      logEntry.responseTime = responseTime;
-      logEntry.statusCode = proxyRes.statusCode;
-      broadcast({ type: 'update_log', log: logEntry });
+      updateHttpLogOutcome(req, proxyRes.statusCode, responseTime);
     }
     // 更新 stats 响应时间
     if (responseTime > 0) {
@@ -1170,6 +1675,26 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
   // 缓冲模式：http-proxy 的 pipe 会调 bufferedRes.end()，触发 onDone 回调后再 flush
   if (isBufferedRes) {
     res.onDone(() => {
+      const finalResponseTime = Date.now() - (req._lbStartTime || startTime);
+      const retryStatus = getRetryableResponseStatus(proxyRes.statusCode, Buffer.concat(res._buf.chunks));
+      if (retryStatus && retryInfo) {
+        if (retryOriginalFormat(req, res._realRes, retryInfo, reqId, retryStatus)) return;
+        const reason = retryReasonForStatus(retryStatus);
+        if (retryAllowed(reason)) {
+          const next = pickHttpRetryTarget(req, retryInfo, reason);
+          if (next && next.target) {
+            const tag = next.switched ? '换节点' : '同节点';
+            const remain = next.switched
+              ? `还可换 ${retryInfo.budgets[reason].backends} 个`
+              : `剩余 ${retryInfo.budgets[reason].same} 次`;
+            console.log(`  🔄 [业务 code ${retryStatus} 重试·${tag}] ${req.method} ${displayRequestPath(req.url)} → ${next.target}  (${remain})`);
+            retryHttpRequest(req, res._realRes, next.target, retryInfo, reqId);
+            return;
+          }
+        }
+      }
+      // 响应体结束才是完整耗时，包含下载和前面的重试时间。
+      updateHttpLogOutcome(req, retryStatus || proxyRes.statusCode, finalResponseTime);
       res.flush();
       if (reqId) retryRequests.delete(reqId);
     });
@@ -1253,9 +1778,23 @@ function selectBackend(req, groupName, excludeIds) {
   }
 }
 
+/** 路由规则可选固定到同分组某 HTTP 节点；节点不可用时仍回退至分组调度。 */
+function selectRuleBackend(rule, groupName) {
+  const configuredUrl = normalizeBackendUrl(rule?.backendUrl || '');
+  if (!configuredUrl) return null;
+  return Array.from(backends.values()).find(backend =>
+    backend.type === 'http'
+    && backend.alive
+    && !backend.disabled
+    && backendInGroup(backend, groupName)
+    && normalizeBackendUrl(backend.url) === configuredUrl
+  ) || null;
+}
+
 // ==================== 健康检查 ====================
 function healthCheck() {
   for (const [, backend] of backends) {
+    if (backend.disabled || backend._hcPending) continue;
     if (backend.disable_health_check) {
       // 用户主动禁用了健康检查 — 始终视为 alive
       if (!backend.alive) {
@@ -1279,8 +1818,12 @@ function healthCheck() {
     let u;
     try { u = new URL(backend.url); } catch { continue; }
 
-    const req = mod.get(u, (res) => {
+    backend._hcPending = true;
+    const req = mod.get(u, { agent: false }, (res) => {
       clearTimeout(timer);
+      res.resume();
+      backend._hcPending = false;
+      backend.lastCheck = Date.now();
       // 只有连接错误才判死；任何 HTTP 响应（哪怕 400/404）都认为 alive
       // 因为后端可能只接受 POST，GET 会返 400 但实际是好的
       if (!backend.alive) {
@@ -1294,6 +1837,8 @@ function healthCheck() {
     }, CONFIG.hc_timeout);
     req.on('error', (err) => {
       clearTimeout(timer);
+      backend._hcPending = false;
+      backend.lastCheck = Date.now();
       // 只在连续 3 次失败后才标 dead（更宽容）
       backend._hcFails = (backend._hcFails || 0) + 1;
       if (backend._hcFails >= 3) {
@@ -1313,32 +1858,135 @@ function setDead(b) {
 const qqStats = {
   totalUnique: 0,           // 总去重 QQ 数
   todayUnique: 0,           // 今日去重 QQ 数
-  recentQQs: new Set(),     // 今日/本次运行的 QQ Set
+  recentQQs: new Set(),     // 今日 QQ Set
   qqHistory: new Array(60).fill(0),  // 近 60 秒秒级新增 QQ 数
   lastQqMinute: new Date().getMinutes(),
   totalRequests: 0,         // 包含 QQ 参数的请求总数
 };
 
-// 持久化/恢复 QQ 统计
-function saveQqStats() {
+// 持久化/恢复 QQ 统计：all-qq.txt 只追加，total.count 很小，当前日独立去重。
+const qqPersistence = {
+  allQQs: new Set(),
+  dayKey: '',
+  pending: new Map(),
+  flushTimer: null,
+  loaded: false,
+};
+
+function qqDayKey(date = new Date()) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+function qqDayPath(dayKey) {
+  return path.join(QQ_STATS_DIR, `${dayKey}.txt`);
+}
+
+function validQQValue(value) {
+  return typeof value === 'string' && value.length > 0 && value.length <= 30 && !/[\r\n]/.test(value);
+}
+
+function readQqLines(filePath) {
   try {
-    const arr = Array.from(qqStats.recentQQs);
-    const data = { totalUnique: qqStats.totalUnique, todayUnique: arr.length, qqSet: arr };
-    CONFIG._qq_stats = data;
-    saveConfig();
-  } catch (_) {}
+    if (!fs.existsSync(filePath)) return [];
+    return fs.readFileSync(filePath, 'utf8').split(/\r?\n/).filter(validQQValue);
+  } catch (_) {
+    return [];
+  }
+}
+
+function queueQqLine(filePath, qq) {
+  if (!validQQValue(qq)) return;
+  const lines = qqPersistence.pending.get(filePath) || [];
+  lines.push(qq);
+  qqPersistence.pending.set(filePath, lines);
+  if (!qqPersistence.flushTimer) {
+    qqPersistence.flushTimer = setTimeout(() => {
+      qqPersistence.flushTimer = null;
+      flushQqStats();
+    }, 1000);
+  }
+}
+
+function flushQqStats() {
+  if (!CONFIG.persist_stats) return;
+  try {
+    fs.mkdirSync(QQ_STATS_DIR, { recursive: true });
+    for (const [filePath, lines] of qqPersistence.pending) {
+      if (!lines.length) continue;
+      fs.appendFileSync(filePath, `${lines.join('\n')}\n`, 'utf8');
+      qqPersistence.pending.delete(filePath);
+    }
+    qqPersistence.pending.clear();
+    const tempPath = `${QQ_TOTAL_PATH}.tmp-${process.pid}`;
+    fs.writeFileSync(tempPath, `${qqStats.totalUnique}\n`, 'utf8');
+    fs.renameSync(tempPath, QQ_TOTAL_PATH);
+  } catch (error) { console.error(`  ⚠️ QQ 统计保存失败（待写数据已保留）: ${error.message}`); }
+}
+
+function rolloverQqDay() {
+  const currentDay = qqDayKey();
+  if (qqPersistence.dayKey === currentDay) return;
+  qqPersistence.dayKey = currentDay;
+  qqStats.recentQQs.clear();
+  qqStats.todayUnique = 0;
+  qqStats.qqHistory.fill(0);
+  qqStats.lastQqMinute = new Date().getMinutes();
+  if (!CONFIG.persist_stats || !qqPersistence.loaded) return;
+  for (const qq of readQqLines(qqDayPath(currentDay))) qqStats.recentQQs.add(qq);
+  qqStats.todayUnique = qqStats.recentQQs.size;
+}
+
+function saveQqStats() {
+  // 只刷追加队列和一个小计数文件，不触碰 config.json。
+  flushQqStats();
 }
 
 function loadQqStats() {
   try {
-    const data = CONFIG._qq_stats;
-    if (data && Array.isArray(data.qqSet)) {
-      for (const qq of data.qqSet) qqStats.recentQQs.add(qq);
-      qqStats.totalUnique = data.totalUnique || 0;
-      qqStats.todayUnique = qqStats.recentQQs.size;
+    fs.mkdirSync(QQ_STATS_DIR, { recursive: true });
+    for (const qq of readQqLines(QQ_ALL_PATH)) qqPersistence.allQQs.add(qq);
+    const storedTotal = Number.parseInt(fs.existsSync(QQ_TOTAL_PATH) ? fs.readFileSync(QQ_TOTAL_PATH, 'utf8') : '0', 10) || 0;
+    qqStats.totalUnique = Math.max(storedTotal, qqPersistence.allQQs.size);
+    qqPersistence.dayKey = qqDayKey();
+    for (const qq of readQqLines(qqDayPath(qqPersistence.dayKey))) qqStats.recentQQs.add(qq);
+
+    // 一次性兼容旧版本：把 config.json 中的 _qq_stats 迁移到追加式文件，然后删除大数组。
+    const legacy = CONFIG._qq_stats;
+    if (legacy && Array.isArray(legacy.qqSet)) {
+      const newAll = [];
+      const newToday = [];
+      for (const raw of legacy.qqSet) {
+        const qq = String(raw);
+        if (!validQQValue(qq)) continue;
+        if (!qqPersistence.allQQs.has(qq)) {
+          qqPersistence.allQQs.add(qq);
+          newAll.push(qq);
+        }
+        // 旧数据没有日期时只能确认历史总数，不能冒充今天的访问。
+        if (legacy.dayKey === qqPersistence.dayKey && !qqStats.recentQQs.has(qq)) {
+          qqStats.recentQQs.add(qq);
+          newToday.push(qq);
+        }
+      }
+      if (newAll.length) fs.appendFileSync(QQ_ALL_PATH, `${newAll.join('\n')}\n`, 'utf8');
+      if (newToday.length) fs.appendFileSync(qqDayPath(qqPersistence.dayKey), `${newToday.join('\n')}\n`, 'utf8');
+      qqStats.totalUnique = Math.max(qqStats.totalUnique, Number(legacy.totalUnique) || 0, qqPersistence.allQQs.size);
+      delete CONFIG._qq_stats;
+      saveConfig();
     }
-  } catch (_) {}
+    qqStats.todayUnique = qqStats.recentQQs.size;
+    fs.writeFileSync(QQ_TOTAL_PATH, `${qqStats.totalUnique}\n`, 'utf8');
+    qqPersistence.loaded = true;
+  } catch (error) {
+    console.error(`  ⚠️ QQ 统计恢复失败: ${error.message}`);
+  }
 }
+
+const qqDayTimer = setInterval(rolloverQqDay, 60000);
+qqDayTimer.unref();
 
 /** 请求样本缓存（用于调试 QQ 提取） */
 const requestSamples = [];
@@ -1352,8 +2000,8 @@ function sampleRequest(req, foundQQ) {
       time: new Date().toLocaleTimeString(),
       url: req.url,
       method: req.method,
-      query: req.query ? JSON.stringify(req.query).slice(0, 200) : null,
-      body: req.body && typeof req.body === 'object' ? JSON.stringify(req.body).slice(0, 200) : null,
+      query: req.query ? `${Object.keys(req.query).length} 个参数` : null,
+      body: req.body && typeof req.body === 'object' ? `${Object.keys(req.body).length} 个字段` : null,
       hasQQ: !!foundQQ,
       headers: JSON.stringify({
         'content-type': req.headers['content-type'],
@@ -1420,12 +2068,24 @@ function extractQQ(req) {
 function recordQQ(qq) {
   if (!qq) return;
   // 限长防滥用
-  if (qq.length > 30) return;
+  if (!validQQValue(qq)) return;
+
+  rolloverQqDay();
 
   if (!qqStats.recentQQs.has(qq)) {
     qqStats.recentQQs.add(qq);
-    qqStats.totalUnique++;
+    const globalNew = !qqPersistence.allQQs.has(qq);
+    if (globalNew) qqStats.totalUnique++;
+    if (globalNew) qqPersistence.allQQs.add(qq);
     qqStats.todayUnique = qqStats.recentQQs.size;
+
+    if (CONFIG.persist_stats && qqPersistence.loaded) {
+      if (globalNew) {
+        qqPersistence.allQQs.add(qq);
+        queueQqLine(QQ_ALL_PATH, qq);
+      }
+      queueQqLine(qqDayPath(qqPersistence.dayKey), qq);
+    }
 
     // 秒级统计（用于图表）
     const curMin = new Date().getMinutes();
@@ -1437,16 +2097,12 @@ function recordQQ(qq) {
     const idx = qqStats.qqHistory.length - 1;
     qqStats.qqHistory[idx]++;
 
-    // 每 10 个新 QQ 持久化一次（之前 20 个，减少数据丢失）
-    if (qqStats.totalUnique % 10 === 0 && CONFIG.persist_stats) {
-      saveQqStats();
-    }
   }
   qqStats.totalRequests++;
 }
 
 function recordLog(req, backend, opts = {}) {
-  const { success, responseTime, statusCode } = opts;
+  const { success, responseTime, statusCode, deferBroadcast = false } = opts;
   const now = new Date();
   // 不记录 favicon.ico
   if (req.url === '/favicon.ico' || req.url === '/robots.txt') return null;
@@ -1482,7 +2138,7 @@ function recordLog(req, backend, opts = {}) {
   const groupAlgo = getGroupAlgorithm(groupName);
   const logEntry = {
     id: uuidv4(), time: now.toLocaleTimeString(),
-    method: req.method, path: req.url,
+    method: req.method, path: displayRequestPath(req.url), fullPath: req.url,
     sourceIp: (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket?.remoteAddress || req.connection?.remoteAddress || 'unknown',
     backend: backend ? (backend.type === 'tunnel' ? `🔌 ${backend.tag}` : backend.url) : '无可用节点',
     backendTag: backend?.tag || '-', type: backend?.type || 'none',
@@ -1492,7 +2148,7 @@ function recordLog(req, backend, opts = {}) {
   requestLogs.push(logEntry);
   if (requestLogs.length > CONFIG.max_log) requestLogs.shift();
   // 日志节流：每秒超过一定量的请求不逐个发 ws 推送
-  if (stats.totalRequests - stats.shownLogIndex < 100) {
+  if (!deferBroadcast && stats.totalRequests - stats.shownLogIndex < 100) {
     broadcast({ type: 'new_log', log: logEntry });
   }
   return logEntry;
@@ -1500,26 +2156,55 @@ function recordLog(req, backend, opts = {}) {
 
 // ==================== WebSocket 广播（管理前端） ====================
 function broadcast(message) {
+  if (!wsSubscribers.size) return;
   const msg = JSON.stringify(message);
   for (const ws of wsSubscribers) {
-    if (ws.readyState === WebSocket.OPEN) { try { ws.send(msg); } catch (_) {} }
+    if (ws.readyState !== WebSocket.OPEN) continue;
+    // 慢客户端不能无限积压管理消息；重连后 init 会恢复完整状态。
+    if (ws.bufferedAmount > 1024 * 1024) { ws.terminate(); continue; }
+    try { ws.send(msg); } catch (_) {}
   }
 }
 
 // ==================== 隧道转发 ====================
 
 function forwardViaTunnel(req, res, backend, retryState) {
+  req._lbBackendId = backend.id;
+  prepareForwardRequest(req);
   const requestId = uuidv4();
   const startTime = Date.now();
   let clientAborted = false;
-  if (!retryState) retryState = { sameRetriesLeft: CONFIG.retry_400_max || 2, backendsLeft: (CONFIG.retry_400_max_backends || 3) - 1, triedIds: new Set() };
+  if (!retryState) retryState = { budgets: retryBudgets(), triedIds: new Set() };
   retryState.triedIds.add(backend.id);
   backend.connections = (backend.connections || 0) + 1;
+
+  // 502/504/传输失败：先重试当前隧道节点，耗尽后再换节点。
+  const failover502 = (note) => {
+    if (!CONFIG.retry_502_enabled) return false;
+    const b = retryState.budgets['502'];
+    if (b.same > 0) {
+      b.same--;
+      console.log(`  🔄 [502 重试·隧道·${note}·同节点] ${req.method} ${req.url} → ${backend.tag}  (剩余 ${b.same} 次)`);
+      forwardViaTunnel(req, res, backend, retryState);
+      return true;
+    }
+    if (b.backends > 0) {
+      const nb = selectBackend(req, req._lbGroup || 'default', retryState.triedIds);
+      if (nb && nb.type === 'tunnel') {
+        b.backends--;
+        b.same = CONFIG.retry_502_max || 2;
+        console.log(`  🔄 [502 重试·隧道·${note}·换节点] ${req.method} ${req.url} ${backend.tag} → ${nb.tag}  (还可换 ${b.backends} 个)`);
+        forwardViaTunnel(req, res, nb, retryState);
+        return true;
+      }
+    }
+    return false;
+  };
 
   // Express 已经消费了请求流，直接使用捕获的原始 body，避免在
   // readableEnded 后再次监听 data/end 导致隧道请求永久等待。
   const sendRequest = () => {
-    const body = req._rawBody && req._rawBody.length > 0 ? req._rawBody.toString('utf8') : '';
+    const body = req._lbForwardBody && req._lbForwardBody.length > 0 ? req._lbForwardBody.toString('utf8') : '';
     const timer = setTimeout(() => {
       const pend = pendingRequests.get(requestId);
       if (pend) { pend.reject(new Error('隧道请求超时')); pendingRequests.delete(requestId); }
@@ -1549,6 +2234,7 @@ function forwardViaTunnel(req, res, backend, retryState) {
     } catch (err) {
       clearTimeout(timer); pendingRequests.delete(requestId);
       backend.connections = Math.max(0, (backend.connections || 0) - 1);
+      if (failover502('发送失败')) return;
       const log = recordLog(req, backend, { success: false, responseTime: Date.now() - startTime, statusCode: 502 });
       broadcast({ type: 'new_log', log });
       return res.status(502).json({ ret: -1, error: '隧道发送失败', message: err.message });
@@ -1562,23 +2248,24 @@ function forwardViaTunnel(req, res, backend, retryState) {
       if (clientAborted || res.writableEnded || res.destroyed) return;
       backend.responseTime = backend.responseTime ? Math.round(backend.responseTime * 0.7 + rt * 0.3) : rt;
 
-      // ── 400 自动重试（先同节点，再换节点） ──
-      if (CONFIG.retry_400_enabled && response.statusCode === 400) {
-        // 策略1: 先在当前节点重试
-        if (retryState.sameRetriesLeft > 0) {
-          retryState.sameRetriesLeft--;
-          console.log(`  🔄 [400 重试·隧道·同节点] ${req.method} ${req.url} → ${backend.tag}  (剩余 ${retryState.sameRetriesLeft} 次)`);
-          return forwardViaTunnel(req, res, backend, retryState);
-        }
-        // 策略2: 换节点
-        if (retryState.backendsLeft > 0) {
-          const group = req._lbGroup || 'default';
-          const newBackend = selectBackend(req, group, retryState.triedIds);
-          if (newBackend) {
-            retryState.backendsLeft--;
-            retryState.sameRetriesLeft = CONFIG.retry_400_max || 2;
-            console.log(`  🔄 [400 重试·隧道·换节点] ${req.method} ${req.url}  ${backend.tag} → ${newBackend.tag}  (还可换 ${retryState.backendsLeft} 个)`);
-            return forwardViaTunnel(req, res, newBackend, retryState);
+      // ── 400/431/429/502/504 自动重试（先同节点，再换节点） ──
+      if (isRetryableUpstreamStatus(response.statusCode)) {
+        const reason = retryReasonForStatus(response.statusCode);
+        if (retryAllowed(reason)) {
+          const b = retryState.budgets[reason];
+          if (b.same > 0) {
+            b.same--;
+            console.log(`  🔄 [${response.statusCode} 重试·隧道·同节点] ${req.method} ${req.url} → ${backend.tag}  (剩余 ${b.same} 次)`);
+            return forwardViaTunnel(req, res, backend, retryState);
+          }
+          if (b.backends > 0) {
+            const newBackend = selectBackend(req, req._lbGroup || 'default', retryState.triedIds);
+            if (newBackend && newBackend.type === 'tunnel') {
+              b.backends--;
+              b.same = retrySameMax(reason);
+              console.log(`  🔄 [${response.statusCode} 重试·隧道·换节点] ${req.method} ${req.url}  ${backend.tag} → ${newBackend.tag}  (还可换 ${b.backends} 个)`);
+              return forwardViaTunnel(req, res, newBackend, retryState);
+            }
           }
         }
       }
@@ -1599,12 +2286,14 @@ function forwardViaTunnel(req, res, backend, retryState) {
       res.status(response.statusCode || 200);
       res.end(response.body || '');
 
-      const log = recordLog(req, backend, { success: true, responseTime: rt, statusCode: response.statusCode || 200 });
+      const statusCode = response.statusCode || 200;
+      const log = recordLog(req, backend, { success: isSuccessfulStatus(statusCode), responseTime: rt, statusCode });
       broadcast({ type: 'new_log', log });
     }).catch(err => {
       clearTimeout(timer);
       backend.connections = Math.max(0, (backend.connections || 0) - 1);
       const rt = Date.now() - startTime;
+      if (!clientAborted && failover502('隧道请求失败')) return;
       const log = recordLog(req, backend, { success: false, responseTime: rt, statusCode: 504 });
       broadcast({ type: 'new_log', log });
       if (!clientAborted && !res.writableEnded && !res.destroyed) {
@@ -1693,7 +2382,7 @@ apiRouter.post('/self-reload', (req, res) => {
 
 apiRouter.get('/stats', (req, res) => {
   const aliveBackends = Array.from(backends.values()).filter(b => b.alive).length;
-  res.json({ ret: 0, data: { ...stats, currentRps: calcRps(stats), totalBackends: backends.size, aliveBackends, currentAlgorithm, groups: Object.keys(groups) } });
+  res.json({ ret: 0, data: { ...stats, currentRps: calcRps(), totalBackends: backends.size, aliveBackends, currentAlgorithm, groups: Object.keys(groups) } });
 });
 apiRouter.get('/qqstats', (req, res) => {
   res.json({ ret: 0, data: {
@@ -1718,11 +2407,13 @@ apiRouter.get('/backends', (req, res) => {
   const list = Array.from(backends.values()).map(b => {
     const base = {
       id: b.id, type: b.type, weight: b.weight, tag: b.tag || '',
-      group: b.group || 'default',
+      group: backendGroupNames(b)[0], groups: backendGroupNames(b),
       alive: b.alive, connections: b.connections || 0,
       responseTime: Math.round(b.responseTime || 0),
       totalRequests: b.totalRequests || 0, successRequests: b.successRequests || 0, failRequests: b.failRequests || 0,
       disable_health_check: !!b.disable_health_check,
+      query_to_json_enabled: !!b.query_to_json_enabled,
+      post_to_get_enabled: !!b.post_to_get_enabled,
       disabled: !!b.disabled,
       createdAt: b.createdAt, lastCheck: b.lastCheck
     };
@@ -1734,20 +2425,22 @@ apiRouter.get('/backends', (req, res) => {
 });
 
 apiRouter.post('/backends', (req, res) => {
-  const { url, weight = 1, tag = '', group: groupName = 'default', disable_health_check = false } = req.body;
+  const { url, weight = 1, tag = '', group: groupName = 'default', disable_health_check = false, query_to_json_enabled = false, post_to_get_enabled = false } = req.body;
   if (!url) return res.status(400).json({ ret: -1, error: '请输入后端地址' });
   if (!url.startsWith('http://') && !url.startsWith('https://'))
     return res.status(400).json({ ret: -1, error: '地址须以 http:// 或 https:// 开头' });
-  if (groupName !== 'default' && !groups[groupName]) return res.status(400).json({ ret: -1, error: `分组不存在: ${groupName}` });
+  const selection = validateBackendGroups(req.body.groups !== undefined ? req.body.groups : groupName);
+  if (selection.error) return res.status(400).json({ ret: -1, error: selection.error });
   for (const [, b] of backends) { if (b.type === 'http' && b.url === url) return res.status(400).json({ ret: -1, error: '该地址已存在' }); }
   const id = uuidv4();
   const backend = {
-    id, type: 'http', url, weight: Math.max(1, parseInt(weight) || 1), tag: tag || '',
-    group: groupName, alive: true, connections: 0, responseTime: 0,
+    id, type: 'http', url, weight: normalizeBackendWeight(weight), tag: tag || '',
+    alive: true, connections: 0, responseTime: 0,
     totalRequests: 0, successRequests: 0, failRequests: 0,
-    disable_health_check: !!disable_health_check,
+    disable_health_check: !!disable_health_check, query_to_json_enabled: !!query_to_json_enabled && !post_to_get_enabled, post_to_get_enabled: !!post_to_get_enabled,
     createdAt: Date.now(), lastCheck: Date.now()
   };
+  setBackendGroups(backend, selection.names);
   backends.set(id, backend);
   saveBackends();  // 持久化 HTTP 后端
   broadcast({ type: 'backend_added', backend });
@@ -1757,12 +2450,26 @@ apiRouter.post('/backends', (req, res) => {
 apiRouter.put('/backends/:id', (req, res) => {
   if (!backends.has(req.params.id)) return res.status(404).json({ ret: -1, error: '后端不存在' });
   const b = backends.get(req.params.id);
+  let selectedGroups = null;
+  if (req.body.groups !== undefined || req.body.group !== undefined) {
+    const selection = validateBackendGroups(req.body.groups !== undefined ? req.body.groups : req.body.group);
+    if (selection.error) return res.status(400).json({ ret: -1, error: selection.error });
+    selectedGroups = selection.names;
+  }
   if (req.body.url !== undefined && b.type === 'http') b.url = req.body.url;
-  if (req.body.weight !== undefined) b.weight = Math.max(1, parseInt(req.body.weight) || 1);
+  if (req.body.weight !== undefined) b.weight = normalizeBackendWeight(req.body.weight);
   if (req.body.disable_health_check !== undefined) b.disable_health_check = !!req.body.disable_health_check;
+  if (req.body.query_to_json_enabled !== undefined) {
+    b.query_to_json_enabled = !!req.body.query_to_json_enabled;
+    if (b.query_to_json_enabled) b.post_to_get_enabled = false;
+  }
+  if (req.body.post_to_get_enabled !== undefined) {
+    b.post_to_get_enabled = !!req.body.post_to_get_enabled;
+    if (b.post_to_get_enabled) b.query_to_json_enabled = false;
+  }
   if (req.body.disabled !== undefined) b.disabled = !!req.body.disabled;
   if (req.body.tag !== undefined) b.tag = req.body.tag || '';
-  if (req.body.group !== undefined && groups[req.body.group]) b.group = req.body.group;
+  if (selectedGroups) setBackendGroups(b, selectedGroups);
   saveBackends();
   broadcast({ type: 'backend_updated', backend: b });
   res.json({ ret: 0, data: b });
@@ -1847,8 +2554,9 @@ apiRouter.delete('/groups/:name', (req, res) => {
   if (req.params.name === 'default') return res.status(400).json({ ret: -1, error: '不能删除默认分组' });
   if (!groups[req.params.name]) return res.status(404).json({ ret: -1, error: '分组不存在' });
   delete groups[req.params.name];
-  // 将该分组的后端移回 default
-  for (const [, b] of backends) { if ((b.group || 'default') === req.params.name) b.group = 'default'; }
+  // 从节点成员关系中移除该分组；没有剩余分组的节点回到 default。
+  for (const [, b] of backends) setBackendGroups(b, backendGroupNames(b).filter(name => name !== req.params.name));
+  saveBackends();
   syncConfigGroupsRules();
   broadcast({ type: 'groups_updated', groups });
   res.json({ ret: 0, message: '已删除', data: groups });
@@ -1864,7 +2572,7 @@ apiRouter.post('/rules', (req, res) => {
   if (!rulePath) return res.status(400).json({ ret: -1, error: '请指定路径匹配规则' });
   if (!group) return res.status(400).json({ ret: -1, error: '请指定目标分组' });
   if (!groups[group]) return res.status(400).json({ ret: -1, error: `分组不存在: ${group}` });
-  if (!['prefix', 'query', 'json'].includes(matchType)) return res.status(400).json({ ret: -1, error: 'matchType 必须为 prefix、query 或 json' });
+  if (!RULE_MATCH_TYPES.has(matchType)) return res.status(400).json({ ret: -1, error: 'matchType 不支持' });
   const rule = { id: ruleIdCounter++, path: rulePath, group, priority: parseInt(priority) || 0, matchType };
   rules.push(rule);
   updateSortedRules();
@@ -1887,7 +2595,7 @@ apiRouter.put('/rules/:id', (req, res) => {
   const idx = rules.findIndex(r => r.id === parseInt(req.params.id));
   if (idx === -1) return res.status(404).json({ ret: -1, error: '规则不存在' });
   const { path: rulePath, group, priority, matchType } = req.body;
-  if (matchType && !['prefix', 'query', 'json'].includes(matchType)) return res.status(400).json({ ret: -1, error: 'matchType 必须是 prefix、query 或 json' });
+  if (matchType && !RULE_MATCH_TYPES.has(matchType)) return res.status(400).json({ ret: -1, error: 'matchType 不支持' });
   if (group && !groups[group]) return res.status(400).json({ ret: -1, error: `分组不存在: ${group}` });
   if (rulePath !== undefined) rules[idx].path = rulePath;
   if (group !== undefined) rules[idx].group = group;
@@ -1929,7 +2637,7 @@ apiRouter.get('/config/export', (req, res) => {
   const backendsList = [];
   for (const [, b] of backends) {
     if (b.type === 'http') {
-      backendsList.push({ id: b.id, type: b.type, url: b.url, weight: b.weight, tag: b.tag || '', group: b.group || 'default', disable_health_check: !!b.disable_health_check, createdAt: b.createdAt });
+      backendsList.push({ id: b.id, type: b.type, url: b.url, weight: b.weight, tag: b.tag || '', group: backendGroupNames(b)[0], groups: backendGroupNames(b), disable_health_check: !!b.disable_health_check, query_to_json_enabled: !!b.query_to_json_enabled, post_to_get_enabled: !!b.post_to_get_enabled, createdAt: b.createdAt });
     }
   }
   const exportData = {
@@ -1972,7 +2680,7 @@ apiRouter.post('/config/import', (req, res) => {
     const importedRules = data.rules.filter(rule => rule && typeof rule === 'object'
       && typeof rule.path === 'string' && rule.path.length <= 500
       && typeof rule.group === 'string' && groups[rule.group]
-      && ['prefix', 'query', 'json'].includes(rule.matchType || 'prefix'))
+      && RULE_MATCH_TYPES.has(rule.matchType || 'prefix'))
       .map(rule => ({
         id: Number.isInteger(rule.id) ? rule.id : ruleIdCounter++,
         path: rule.path,
@@ -1989,15 +2697,18 @@ apiRouter.post('/config/import', (req, res) => {
   if (Array.isArray(data.backends) && data.backends.length <= 200) {
     for (const [, b] of backends) { if (b.type === 'http') backends.delete(b.id); }
     for (const b of data.backends) {
-      if (b && typeof b.url === 'string' && /^https?:\/\//i.test(b.url) && groups[b.group || 'default']) {
+      const selection = b && validateBackendGroups(b.groups || b.group || 'default');
+      if (b && typeof b.url === 'string' && /^https?:\/\//i.test(b.url) && !selection.error) {
         const id = b.id || uuidv4();
-        backends.set(id, {
-          id, type: 'http', url: b.url, weight: Math.max(1, parseInt(b.weight, 10) || 1), tag: String(b.tag || '').slice(0, 100),
-          group: b.group || 'default', alive: true, connections: 0, responseTime: 0,
+        const backend = {
+          id, type: 'http', url: b.url, weight: normalizeBackendWeight(b.weight), tag: String(b.tag || '').slice(0, 100),
+          alive: true, connections: 0, responseTime: 0,
           totalRequests: 0, successRequests: 0, failRequests: 0,
-          disable_health_check: !!b.disable_health_check,
+          disable_health_check: !!b.disable_health_check, query_to_json_enabled: !!b.query_to_json_enabled, post_to_get_enabled: !!b.post_to_get_enabled,
           createdAt: b.createdAt || Date.now(), lastCheck: Date.now()
-        });
+        };
+        setBackendGroups(backend, selection.names);
+        backends.set(id, backend);
       }
     }
   }
@@ -2058,6 +2769,8 @@ apiRouter.post('/logout', (req, res) => {
 });
 
 apiRouter.put('/config', (req, res) => {
+  const previousConfig = CONFIG;
+  const nextConfig = { ...CONFIG };
   for (const key of CONFIG_MUTABLE_KEYS) {
     if (req.body[key] !== undefined) {
       if (key === 'admin_password' && (typeof req.body[key] !== 'string' || req.body[key].length < 8 || req.body[key].length > 200)) {
@@ -2068,26 +2781,32 @@ apiRouter.put('/config', (req, res) => {
         if (!Number.isInteger(value) || value < MIN_REQUEST_TIMEOUT || value > MAX_REQUEST_TIMEOUT) {
           return res.status(400).json({ ret: -1, error: 'request_timeout 必须在 60000-600000ms 之间' });
         }
-        CONFIG[key] = value;
+        nextConfig[key] = value;
       } else if (['hc_interval', 'hc_timeout', 'tunnel_timeout', 'monitor_interval', 'auto_backup_interval'].includes(key)) {
         const value = Number.parseInt(req.body[key], 10);
         if (!Number.isInteger(value) || value < 1000 || value > 7 * 24 * 3600 * 1000) return res.status(400).json({ ret: -1, error: `${key} 数值范围无效` });
-        CONFIG[key] = value;
-      } else if (['max_log', 'max_backups', 'retry_400_max', 'retry_400_max_backends'].includes(key)) {
+        nextConfig[key] = value;
+      } else if (['max_log', 'max_backups', 'retry_400_max', 'retry_400_max_backends', 'retry_502_max', 'retry_502_max_backends'].includes(key)) {
         const value = Number.parseInt(req.body[key], 10);
         if (!Number.isInteger(value) || value < 1 || value > 10000) return res.status(400).json({ ret: -1, error: `${key} 数值范围无效` });
-        CONFIG[key] = value;
+        nextConfig[key] = value;
       } else if (key === 'page_title' || key === 'version_rewrite_target' || key === 'cors_origins') {
         if (typeof req.body[key] !== 'string' || req.body[key].length > 500) return res.status(400).json({ ret: -1, error: `${key} 格式无效` });
-        CONFIG[key] = req.body[key];
+        nextConfig[key] = req.body[key];
       } else {
-        CONFIG[key] = req.body[key];
+        nextConfig[key] = req.body[key];
       }
     }
   }
-  saveConfig();
+  CONFIG = nextConfig;
+  if (!saveConfig()) {
+    CONFIG = previousConfig;
+    return res.status(500).json({ ret: -1, error: '配置写入失败，未应用修改' });
+  }
   applyForwardTimeouts();
   restartHealthCheck();
+  if (req.body.auto_backup_enabled !== undefined || req.body.auto_backup_interval !== undefined) startAutoBackup();
+  if (req.body.monitor_interval !== undefined || req.body.bark_key !== undefined) startMonitor();
   if (req.body.frp_port !== undefined) startFrpsServer();
   broadcast({ type: 'config_updated', config: getClientConfig() });
   res.json({ ret: 0, message: '配置已更新', data: getClientConfig() });
@@ -2102,21 +2821,23 @@ apiRouter.get('/overview', (req, res) => {
   const backendList = Array.from(backends.values()).map(b => {
     const base = {
       id: b.id, type: b.type, weight: b.weight, tag: b.tag || '',
-      group: b.group || 'default',
+      group: backendGroupNames(b)[0], groups: backendGroupNames(b),
       alive: b.alive, connections: b.connections || 0,
       responseTime: Math.round(b.responseTime || 0),
       totalRequests: b.totalRequests || 0, successRequests: b.successRequests || 0, failRequests: b.failRequests || 0,
       disable_health_check: !!b.disable_health_check,
+      query_to_json_enabled: !!b.query_to_json_enabled,
+      post_to_get_enabled: !!b.post_to_get_enabled,
       disabled: !!b.disabled,
       createdAt: b.createdAt, lastCheck: b.lastCheck
     };
-    if (b.type === 'http') base.url = b.url;
+    if (b.type === 'http') { base.url = b.url; }
     if (b.type === 'tunnel') { base.remoteAddress = b.remoteAddress || 'unknown'; base.connectedAt = b.connectedAt; }
     return base;
   });
   res.json({
     ret: 0, data: {
-      stats: { ...stats, currentRps: calcRps(stats), totalBackends: backends.size, aliveBackends: backendList.filter(b => b.alive).length, currentAlgorithm },
+      stats: { ...stats, currentRps: calcRps(), totalBackends: backends.size, aliveBackends: backendList.filter(b => b.alive).length, currentAlgorithm },
       qqStats: {
         totalUnique: qqStats.totalUnique,
         todayUnique: qqStats.todayUnique,
@@ -2141,55 +2862,57 @@ app.use('/js', express.static(path.join(publicPath, 'js')));
 app.use('/lib', express.static(path.join(publicPath, 'lib')));
 
 // ─── 代理/隧道转发入口 ──────────────────────────────
-app.use((req, res) => {
+function handleProxyRequest(req, res) {
   // 浏览器自动请求，不转发也不记录
   if (req.url === '/favicon.ico' || req.url === '/robots.txt') {
     return res.status(204).end();
   }
-  // 先按 URL 匹配（prefix / query）
-  let groupName = matchGroup(req.url);
-  // JSON 规则覆盖：无论之前匹配到什么，都再检查 JSON body 规则（高优先级覆盖）
-  if (req.body && typeof req.body === 'object') {
-    const jsonGroup = matchGroupByBody(req.path, req.body);
-    if (jsonGroup) groupName = jsonGroup;
-  }
+  recordIncomingRequest();
+  const debugBackend = selectDebugRoute(req);
+  const groupName = debugBackend ? '__debug__' : matchGroup(req);
   req._lbGroup = groupName;
-  const groupAlgo = req._lbAlgo = getGroupAlgorithm(groupName);
-  const backend = selectBackend(req, groupName);
+  const groupAlgo = req._lbAlgo = debugBackend ? 'debug' : getGroupAlgorithm(groupName);
+  const ruleBackend = debugBackend ? null : selectRuleBackend(req._lbMatchedRule, groupName);
+  const backend = debugBackend || ruleBackend || selectBackend(req, groupName);
   if (!backend) {
     recordLog(req, null, { success: false, responseTime: 0, statusCode: 502 });
     // 让分组里所有 dead 后端都记一次失败（健康检查可能没及时）
     const peers = getAliveBackendsInGroup(groupName);
     if (peers.length === 0) {
       // 分组里没有任何 alive 后端，列出该分组所有后端并全部算失败
-      const allInGroup = Array.from(backends.values()).filter(b => (b.group || 'default') === groupName);
+      const allInGroup = Array.from(backends.values()).filter(b => backendInGroup(b, groupName));
       for (const b of allInGroup) b.failRequests = (b.failRequests || 0) + 1;
     }
       return res.status(502).json({ ret: -1, error: `[${groupName}] 没有可用的后端节点`, lb: { group: { name: groupName, algorithm: groupAlgo } } });
   }
+  req._lbBackendId = backend.id;
+  req._lbBackend = backend;
+  req._lbDebugRoute = !!debugBackend;
   if (backend.type === 'tunnel') {
+    prepareForwardRequest(req);
     return forwardViaTunnel(req, res, backend);
   }
   if (backend.type === 'frp') {
+    prepareForwardRequest(req);
     return forwardViaFrp(req, res, backend);
   }
   // HTTP 代理
   req._lbStartTime = Date.now();
   req._lbBackendId = backend.id;
   req._lbGroup = groupName;
-  // 初始化 400 重试追踪（先在当前节点重试，不行再换节点）
-  if (CONFIG.retry_400_enabled) {
+  // 初始化失败重试追踪（400 与 431/429/502/504 各自独立预算，先同节点重试，不行再换节点）
+  const needsBufferedResponse = anyRetryEnabled() || !!backend.query_to_json_enabled || !!backend.post_to_get_enabled;
+  if (needsBufferedResponse) {
     req._lbReqId = uuidv4();
     retryRequests.set(req._lbReqId, {
-      sameRetriesLeft: CONFIG.retry_400_max || 2,
-      backendsLeft: (CONFIG.retry_400_max_backends || 3) - 1,
+      budgets: retryBudgets(),
       triedBackendIds: new Set([backend.id])
     });
   }
   backend.connections = (backend.connections || 0) + 1;
-  const logEntry = recordLog(req, backend, { success: true, responseTime: 0 });
+  const logEntry = recordLog(req, backend, { success: true, responseTime: 0, deferBroadcast: true });
   req._lbLogEntry = logEntry;
-  broadcast({ type: 'new_log', log: logEntry });
+  req._lbLogBackendId = backend.id;
   // 重新注入请求体（应用 ver 改写）
   if (req._rawBody && req._rawBody.length > 0) {
     // 优先用原始 body（保留 urlencoded 格式）
@@ -2208,22 +2931,41 @@ app.use((req, res) => {
     req.headers['content-length'] = Buffer.byteLength(bodyStr);
     req._lbOriginalBody = Buffer.from(bodyStr);
   }
-  // 使用缓冲响应包装器（支持 400 重试）或直接转发
-  const targetRes = CONFIG.retry_400_enabled ? createBufferedRes(res) : res;
+  prepareForwardRequest(req);
+  // 日志同时保留入口原始方法和实际发给节点的方法，避免把节点转换误看成客户端请求变化。
+  logEntry.forwardMethod = req.method;
+  logEntry.forwardPath = displayRequestPath(req.url);
+  logEntry.forwardFullPath = req.url;
+  logEntry.transform = req._lbAppliedTransform || null;
+  if (stats.totalRequests - stats.shownLogIndex < 100) broadcast({ type: 'new_log', log: logEntry });
+  // 使用缓冲响应包装器（支持失败重试）或直接转发
+  const targetRes = needsBufferedResponse ? createBufferedRes(res) : res;
   proxy.web(req, targetRes, {
     target: backend.url,
     // http-proxy 的默认 30 秒会误伤慢初始化接口；这里与隧道等待上限统一。
     proxyTimeout: getForwardTimeout(),
     timeout: getForwardTimeout()
   }, err => {
+    const reqId = req._lbReqId;
+    // 连接/传输失败 → 若启用 502/504 重试且有预算，先同节点重试，预算耗尽才换节点
+    const canRetryConn = !!(targetRes._buf && reqId && CONFIG.retry_502_enabled && !res.headersSent && !res.writableEnded);
+    if (canRetryConn) {
+      const retryInfo = retryRequests.get(reqId);
+      const next = retryInfo ? pickHttpRetryTarget(req, retryInfo, '502') : null;
+      if (next && next.target) {
+        const tag = next.switched ? '换节点' : '同节点';
+        const remain = next.switched
+          ? `还可换 ${retryInfo.budgets['502'].backends} 个`
+          : `剩余 ${retryInfo.budgets['502'].same} 次`;
+        console.log(`  🔄 [502 重试·${tag}] ${req.method} ${req.url} → ${next.target}  (${remain}) 原后端错误: ${err.message}`);
+        retryHttpRequest(req, res, next.target, retryInfo, reqId);
+        return;
+      }
+    }
+    // 无法重试（或预算耗尽）→ 记录失败并按原样返回 502
     backend.connections = Math.max(0, (backend.connections || 0) - 1);
     const rt = Date.now() - req._lbStartTime;
-    if (logEntry) {
-      logEntry.success = false;
-      logEntry.responseTime = rt;
-      logEntry.statusCode = 502;
-      broadcast({ type: 'update_log', log: logEntry });
-    }
+    updateHttpLogOutcome(req, 502, rt);
     // 更新 stats.historyResponseTime（recordLog 初始传入 0 不会更新）
     if (rt > 0) {
       const idx = stats.historyResponseTime.length - 1;
@@ -2231,20 +2973,45 @@ app.use((req, res) => {
       stats.historyResponseTime[idx] = prev + (rt - prev) / stats.historyRequests[idx];
       backend.responseTime = backend.responseTime ? Math.round(backend.responseTime * 0.7 + rt * 0.3) : rt;
     }
-    // 缓冲模式下代理出错，直接给客户端返回 502
-    if (targetRes._buf) {
+    if (!res.headersSent && !res.writableEnded) {
       try { res.status(502).json({ ret: -1, error: '代理错误', message: err.message }); } catch (_) {}
     }
-    if (req._lbReqId) retryRequests.delete(req._lbReqId);
+    if (reqId) retryRequests.delete(reqId);
   });
-});
+}
+
+app.use(handleProxyRequest);
 
 // Normalize JSON/urlencoded parser failures to the API contract instead of
 // returning Express' HTML error page.
+function recoverMislabelledFormRequest(req, error) {
+  if (!error || error.type !== 'entity.parse.failed') return null;
+  const requestPath = String(req.originalUrl || req.url || '').split('?')[0];
+  if (requestPath === '/api' || requestPath.startsWith('/api/')) return null;
+  if (!String(req.headers?.['content-type'] || '').toLowerCase().includes('application/json')) return null;
+  const raw = Buffer.isBuffer(req._rawBody) && req._rawBody.length > 0
+    ? req._rawBody
+    : (error.body ? Buffer.from(error.body) : null);
+  const body = formBodyToPayload(raw);
+  if (!body || !Object.prototype.hasOwnProperty.call(body, 'ver') || !Object.prototype.hasOwnProperty.call(body, 'cmd')) return null;
+  return { raw, body };
+}
+
 app.use((error, req, res, next) => {
   if (res.headersSent) return next(error);
   if (error && (error.type === 'entity.too.large' || error.status === 413)) {
     return res.status(413).json({ ret: -1, error: '请求体过大' });
+  }
+  const recovered = recoverMislabelledFormRequest(req, error);
+  if (recovered) {
+    // 某些旧客户端错误地标注 application/json，却发送 ver=...&cmd=...；
+    // 只在代理入口恢复，管理 API 仍严格校验 JSON。
+    req.headers['content-type'] = 'application/x-www-form-urlencoded';
+    req.headers['content-length'] = String(recovered.raw.length);
+    req._rawBody = recovered.raw;
+    req._lbOriginalBody = recovered.raw;
+    req.body = recovered.body;
+    return handleProxyRequest(req, res);
   }
   return res.status(400).json({ ret: -1, error: '请求格式无效' });
 });
@@ -2332,20 +3099,22 @@ adminWss.on('connection', (ws) => {
   const backendList = Array.from(backends.values()).map(b => {
     const base = {
       id: b.id, type: b.type, weight: b.weight, tag: b.tag || '',
-      group: b.group || 'default',
+      group: backendGroupNames(b)[0], groups: backendGroupNames(b),
       alive: b.alive, connections: b.connections || 0,
       responseTime: Math.round(b.responseTime || 0),
       totalRequests: b.totalRequests || 0, successRequests: b.successRequests || 0, failRequests: b.failRequests || 0,
       disable_health_check: !!b.disable_health_check,
+      query_to_json_enabled: !!b.query_to_json_enabled,
+      post_to_get_enabled: !!b.post_to_get_enabled,
       disabled: !!b.disabled
     };
-    if (b.type === 'http') base.url = b.url;
+    if (b.type === 'http') { base.url = b.url; }
     if (b.type === 'tunnel') base.remoteAddress = b.remoteAddress || 'unknown';
     return base;
   });
   ws.send(JSON.stringify({
     type: 'init', data: {
-      stats: { ...stats, currentRps: calcRps(stats), totalBackends: backends.size, aliveBackends: backendList.filter(b => b.alive).length, currentAlgorithm },
+      stats: { ...stats, currentRps: calcRps(), totalBackends: backends.size, aliveBackends: backendList.filter(b => b.alive).length, currentAlgorithm },
       qqStats: { totalUnique: qqStats.totalUnique, todayUnique: qqStats.todayUnique, totalRequests: qqStats.totalRequests, qqHistory: qqStats.qqHistory },
       page_title: CONFIG.page_title || '负载均衡管理面板',
       algorithm: { name: currentAlgorithm, info: ALGORITHMS[currentAlgorithm] },
@@ -2375,7 +3144,7 @@ agentWss.on('connection', (ws, req) => {
         }
         agentId = uuidv4();
         agentTag = msg.tag || `agent-${agentId.slice(0, 8)}`;
-        // 分组：Agent 指定 > groupKey 匹配预配置 > 默认
+        // 分组：Agent 指定 > groupKey 匹配预配置 > 默认；管理端偏好可恢复为多分组。
         let agentGroup = msg.group || 'default';
         if (!msg.group && msg.groupKey) {
           const preset = (CONFIG.proxy_presets || []).find(p => p.groupKey === msg.groupKey);
@@ -2386,8 +3155,7 @@ agentWss.on('connection', (ws, req) => {
         const prefs = (CONFIG._backend_prefs || []).find(p => p.type === 'tunnel' && p.tag === agentTag);
         const backend = {
           id: agentId, type: 'tunnel', ws,
-          tag: agentTag, weight: prefs?.weight || Math.max(1, parseInt(msg.weight) || 1),
-          group: prefs?.group || agentGroup,
+          tag: agentTag, weight: normalizeBackendWeight(prefs?.weight ?? msg.weight), query_to_json_enabled: !!prefs?.query_to_json_enabled, post_to_get_enabled: !!prefs?.post_to_get_enabled,
           alive: !(prefs?.disabled), connections: 0, responseTime: 0,
           totalRequests: 0, successRequests: 0, failRequests: 0,
           disable_health_check: prefs?.disable_health_check || false,
@@ -2396,6 +3164,7 @@ agentWss.on('connection', (ws, req) => {
           remoteAddress: req.socket?.remoteAddress || 'unknown',
           connectedAt: Date.now()
         };
+        setBackendGroups(backend, prefs?.groups || prefs?.group || msg.groups || agentGroup);
         if (prefs) console.log(`  📋 恢复 ${agentTag} 偏好: group=${backend.group} weight=${backend.weight} hc=${backend.disable_health_check ? 'off' : 'on'}`);
         backends.set(agentId, backend);
         ws.send(JSON.stringify({ type: 'registered', id: agentId, status: 'ok' }));
@@ -2458,26 +3227,29 @@ agentWss.on('connection', (ws, req) => {
 
 // ==================== 定时推送统计（管理前端） ====================
   statsTimer = setInterval(() => {
+  if (!wsSubscribers.size) { calcRps(); return; }
   const backendList = Array.from(backends.values());
   const aliveBackends = backendList.filter(b => b.alive).length;
   broadcast({
     type: 'stats_update', data: {
-      stats: { ...stats, currentRps: calcRps(stats), totalBackends: backends.size, aliveBackends, currentAlgorithm },
+      stats: { ...stats, currentRps: calcRps(), totalBackends: backends.size, aliveBackends, currentAlgorithm },
       qqStats: { totalUnique: qqStats.totalUnique, todayUnique: qqStats.todayUnique, totalRequests: qqStats.totalRequests, qqHistory: qqStats.qqHistory },
       page_title: CONFIG.page_title || '负载均衡管理面板',
       groups, rules: sortedRules,
       backends: backendList.map(b => {
         const base = {
           id: b.id, type: b.type, weight: b.weight, tag: b.tag || '',
-          group: b.group || 'default',
+          group: backendGroupNames(b)[0], groups: backendGroupNames(b),
           alive: b.alive, connections: b.connections || 0,
           responseTime: Math.round(b.responseTime || 0),
           totalRequests: b.totalRequests || 0, successRequests: b.successRequests || 0, failRequests: b.failRequests || 0,
           disable_health_check: !!b.disable_health_check,
+          query_to_json_enabled: !!b.query_to_json_enabled,
+          post_to_get_enabled: !!b.post_to_get_enabled,
           disabled: !!b.disabled,
           lastCheck: b.lastCheck
         };
-        if (b.type === 'http') base.url = b.url;
+        if (b.type === 'http') { base.url = b.url; }
         if (b.type === 'tunnel') base.remoteAddress = b.remoteAddress || 'unknown';
         return base;
       })
@@ -2501,7 +3273,7 @@ function loadMonitorServers() {
     && Number.isInteger(Number(server.port)) && Number(server.port) > 0 && Number(server.port) < 65536)
     .map(server => ({ name: server.name.slice(0, 80), host: server.host, port: Number(server.port) }));
 }
-const MONITOR_SERVERS = loadMonitorServers();
+let MONITOR_SERVERS = [];
 
 function getSelfName() {
   const ips = Object.values(require('os').networkInterfaces()).flat()
@@ -2510,7 +3282,7 @@ function getSelfName() {
     if (ips.some(ip => ip === s.host)) return s.name;
   return 'relay';
 }
-const SELF_NAME = getSelfName();
+let SELF_NAME = 'relay';
 
 const _monitorStatus = {};
 for (const s of MONITOR_SERVERS) _monitorStatus[s.host] = false;
@@ -2553,7 +3325,7 @@ function listBackupFiles() {
 function makeBackupSnapshot() {
   const backendsList = [];
   for (const [, b] of backends) {
-    if (b.type === 'http') backendsList.push({ id: b.id, type: b.type, url: b.url, weight: b.weight, tag: b.tag || '', group: b.group || 'default', disable_health_check: !!b.disable_health_check, createdAt: b.createdAt });
+    if (b.type === 'http') backendsList.push({ id: b.id, type: b.type, url: b.url, weight: b.weight, tag: b.tag || '', group: backendGroupNames(b)[0], groups: backendGroupNames(b), disable_health_check: !!b.disable_health_check, createdAt: b.createdAt });
   }
   const sessionsList = Array.from(activeSessions.entries()).map(([token, s]) => ({ token, ...s }));
   return {
@@ -2679,6 +3451,8 @@ async function runMonitorCheck() {
 let monitorTimer = null;
 function startMonitor() {
   if (monitorTimer) clearInterval(monitorTimer);
+  MONITOR_SERVERS = loadMonitorServers();
+  SELF_NAME = getSelfName();
   if (!CONFIG.bark_key) { console.log('  [MONITOR] Bark Key 未配置，跳过在线监控'); return; }
   runMonitorCheck();
   monitorTimer = setInterval(runMonitorCheck, CONFIG.monitor_interval || 30000);
@@ -2687,11 +3461,13 @@ function startMonitor() {
 
 // ==================== 启动 ====================
 loadConfig();
+loadDebugRoute();
 applyForwardTimeouts();
 const generatedAdminPassword = ensureAdminPassword();
 const newSecret = initAdminSecret();
 initGroupsAndRules();
 loadBackends();
+applyNodeBootstrap();
 if (CONFIG.persist_stats) loadQqStats();
 loadSessions();  // 恢复活动会话
 if (newSecret || generatedAdminPassword) saveConfig(); // 首次生成认证材料，持久化
@@ -2700,7 +3476,7 @@ function restartHealthCheck() {
   if (hcTimer) clearInterval(hcTimer);
   hcTimer = setInterval(healthCheck, CONFIG.hc_interval);
 }
-restartHealthCheck();
+  restartHealthCheck();
 setTimeout(healthCheck, 2000);
 startFrpsServer();
 startMonitor();
@@ -2730,7 +3506,7 @@ rawServer.listen(CONFIG.port, () => {
   console.log(`  ── 分组路由 ──`);
   for (const [gName, g] of Object.entries(groups)) {
     const algo = ALGORITHMS[g.algorithm]?.name || g.algorithm;
-    const backendCount = Array.from(backends.values()).filter(b => (b.group || 'default') === gName).length;
+    const backendCount = Array.from(backends.values()).filter(b => backendInGroup(b, gName)).length;
     console.log(`    📁 ${gName.padEnd(12)} ${algo.padEnd(10)} ${g.description || ''}`);
     console.log(`       后端 ${backendCount} 个`);
   }

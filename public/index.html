@@ -4,16 +4,16 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>负载均衡管理面板</title>
-  <link rel="stylesheet" href="/css/style.css">
+  <link rel="stylesheet" href="/css/style.css?v=20260922">
   <script>{
     const t = localStorage.getItem('lb_theme');
     if (t === 'dark' || (!t && matchMedia('(prefers-color-scheme:dark)').matches))
       document.documentElement.setAttribute('data-theme','dark');
     // 有 token 立即隐藏登录遮罩，避免刷新闪现
-    if (localStorage.getItem('lb_token')) document.write('<style>.login-overlay{display:none!important}</style>');
+    if (localStorage.getItem('lb_token')) document.documentElement.classList.add('auth-pending');
   }</script>
   <script src="/lib/chart.umd.min.js" defer></script>
-  <script src="/js/app.js?v=20260901" defer></script>
+  <script src="/js/app.js?v=20260922" defer></script>
 </head>
 <body>
   <!-- ====== 登录遮罩 ====== -->
@@ -103,6 +103,12 @@
       </section>
 
       <!-- ====== 顶部概览卡片 ====== -->
+      <nav class="section-nav" aria-label="控制台分区">
+        <a href="#statsRow">运行概览</a><a href="#backendSection">节点管理</a>
+        <a href="#algorithmSection">调度算法</a><a href="#logsSection">请求日志</a>
+        <a href="#frpcConfig">Agent 接入</a><a href="#groupsSection">分组路由</a>
+        <a href="#settingsSection">系统设置</a>
+      </nav>
       <section class="stats-row" id="statsRow">
         <div class="stat-card">
           <div class="stat-card-icon blue">
@@ -218,7 +224,7 @@
       </section>
 
       <!-- ====== 实时流量图表 ====== -->
-      <section class="card">
+      <section class="card" id="trafficSection">
         <div class="card-header">
           <h2 class="card-title">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
@@ -369,8 +375,8 @@
               <input type="number" id="newBackendWeight" value="1" min="1" max="100" class="form-input">
             </div>
             <div class="form-group form-group-sm">
-              <label>分组</label>
-              <select id="newBackendGroup" class="form-input"></select>
+              <label>分组（可多选）</label>
+              <button type="button" id="newBackendGroup" class="form-input group-picker-button"><span id="newBackendGroupText">default</span><span aria-hidden="true">▾</span></button>
             </div>
             <div class="form-group">
               <label>标签</label>
@@ -400,7 +406,7 @@
       </section>
 
       <!-- ====== 请求分发日志 ====== -->
-      <section class="card">
+      <section class="card" id="logsSection">
         <div class="card-header">
           <h2 class="card-title">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
@@ -467,11 +473,11 @@
           </h2>
           <button class="btn btn-primary btn-sm" id="showAddRuleBtn">+ 添加规则</button>
         </div>
-        <p class="card-desc">根据请求路径匹配规则，将流量路由到指定分组。优先级高的规则先匹配。</p>
+        <p class="card-desc">支持路径、参数、JSON、关键词、请求头和方法匹配；优先级高的规则先命中并分发到指定分组。</p>
         <div class="add-rule-form" id="addRuleForm" style="display:none">
           <div class="form-row">
             <div class="form-group">
-              <label>路径前缀</label>
+              <label>匹配表达式</label>
               <input type="text" id="newRulePath" placeholder="/api/" class="form-input">
               <span class="form-hint" id="rulePathHint">前缀匹配，如 /api/</span>
             </div>
@@ -481,6 +487,9 @@
                 <option value="prefix">前缀匹配</option>
                 <option value="query">查询参数</option>
                 <option value="json">JSON字段</option>
+                <option value="keyword">关键词包含</option>
+                <option value="header">请求头</option>
+                <option value="method">请求方法</option>
               </select>
               <span class="form-hint" style="visibility:hidden">占位</span>
             </div>
@@ -581,6 +590,22 @@
               <div class="settings-item" style="max-width:160px;margin-left:auto">
                 <label>同节点重试次数</label>
                 <input type="number" id="setRetry400Max" min="1" max="10" placeholder="2" class="form-input">
+              </div>
+            </div>
+          </div>
+
+          <!-- 431/429/502/504/连接失败 自动重试 -->
+          <div class="settings-group">
+            <div class="settings-group-title">🔁 431 / 429 / 502 / 504 / 连接失败 自动重试</div>
+            <div class="settings-row" style="align-items:center">
+              <label class="settings-toggle">
+                <input type="checkbox" id="setRetry502" class="toggle-input">
+                <span class="toggle-slider"></span>
+                <span class="toggle-text">后端返回 431、429、502、504 或连接失败时自动重试（先同节点 N 次，再换节点）</span>
+              </label>
+              <div class="settings-item" style="max-width:160px;margin-left:auto">
+                <label>同节点重试次数</label>
+                <input type="number" id="setRetry502Max" min="1" max="10" placeholder="2" class="form-input">
               </div>
             </div>
           </div>
@@ -705,6 +730,24 @@
       <div class="modal-footer">
         <button class="btn btn-secondary" id="tagModalCancel">取消</button>
         <button class="btn btn-primary" id="tagModalSave">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ====== 节点多分组选择 ====== -->
+  <div class="modal-overlay" id="backendGroupsModal">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="backendGroupsModalTitle">
+      <div class="modal-header">
+        <h3 id="backendGroupsModalTitle">选择节点分组</h3>
+        <button class="modal-close" id="backendGroupsModalClose" type="button" aria-label="关闭">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="group-picker-help">选中的每个分类都可以调度到这个节点，至少选择一个。</p>
+        <div class="group-picker-options" id="backendGroupOptions"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" id="backendGroupsModalCancel" type="button">取消</button>
+        <button class="btn btn-primary" id="backendGroupsModalSave" type="button">保存分组</button>
       </div>
     </div>
   </div>
