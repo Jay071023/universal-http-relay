@@ -2,6 +2,7 @@
   "name": "universal-http-relay",
   "version": "2.1.0",
   "description": "HTTP负载均衡器 - 支持6种算法、动态节点管理、实时监控WebUI",
+  "license": "MIT",
   "main": "lb-server.js",
   "scripts": {
     "start": "node lb-server.js",
