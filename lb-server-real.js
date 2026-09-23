@@ -14,6 +14,12 @@ const { Writable } = require('stream');
 const msgpack = require('@msgpack/msgpack');
 
 // ==================== 进程守护（防崩溃 + 内存监控） ====================
+const DEFAULT_MEMORY_RESTART_MB = 2.8 * 1024;
+const configuredMemoryRestartMb = Number.parseFloat(process.env.LB_MAX_MEMORY_RESTART_MB || String(DEFAULT_MEMORY_RESTART_MB));
+const memoryRestartLimitBytes = (Number.isFinite(configuredMemoryRestartMb) && configuredMemoryRestartMb > 0
+  ? configuredMemoryRestartMb
+  : DEFAULT_MEMORY_RESTART_MB) * 1024 * 1024;
+
 process.on('uncaughtException', (err) => {
   console.error(`\n  ⚠️  [FATAL] 未捕获异常: ${err.message}`);
   console.error(`  ${err.stack}\n`);
@@ -28,6 +34,14 @@ process.on('unhandledRejection', (reason) => {
   console.error(`\n  ⚠️  [WARN] 未处理的 Promise 拒绝: ${reason instanceof Error ? reason.message : reason}`);
   if (reason instanceof Error) console.error(`  ${reason.stack}\n`);
 });
+
+// RSS 超过阈值时走现有 SIGTERM 优雅关闭流程，再由 supervisor/PM2 拉起。
+setInterval(() => {
+  const rss = process.memoryUsage().rss;
+  if (rss < memoryRestartLimitBytes) return;
+  console.error(`\n  ⚠️  [MEMORY] RSS ${(rss / 1024 / 1024).toFixed(1)}MB 超过 ${(memoryRestartLimitBytes / 1024 / 1024).toFixed(1)}MB，准备优雅重启`);
+  process.emit('SIGTERM');
+}, 15000);
 
 // 每 60 秒打印一次内存使用，排查泄漏
 setInterval(() => {
